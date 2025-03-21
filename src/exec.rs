@@ -1,14 +1,14 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::{fmt, slice};
 
 use tokio::process::Command as OsCommand;
 
-use crate::syntax::{RedirectDest, RedirectMode, RedirectPort, Stmt, Word};
+use crate::syntax::{RedirectDest, RedirectMode, RedirectPort, Stmt, Word, WordFrag};
 
 pub mod builtins;
 mod utils;
@@ -43,6 +43,8 @@ pub enum Error {
     OpenRedirectionFile(PathBuf, std::io::Error),
     #[error("failed to spawn process {0:?}: {1}")]
     SpawnProcess(PathBuf, std::io::Error),
+    #[error("variable not found: {0:?}")]
+    VariableNotFound(String),
 
     #[error("failed to create pipe: {0}")]
     CreatePipe(std::io::Error),
@@ -237,7 +239,7 @@ impl<'b> ExecContext<'_, 'b> {
                 let _ret = self.exec_stmt_boxed(body, io.clone()).await;
             },
             Stmt::For(var, elem_ws, body) => {
-                let var = self.expand_words(std::slice::from_ref(var)).await?;
+                let var = self.expand_words(slice::from_ref(var)).await?;
                 let var = validate_variable_words(&var)?;
                 let elems = self.expand_words(elem_ws).await?;
                 for elem in elems {
@@ -250,7 +252,7 @@ impl<'b> ExecContext<'_, 'b> {
             Stmt::Redirect(stmt, redirects) => {
                 for redir in redirects {
                     let (RedirectDest::File(file_word) | RedirectDest::Fd(file_word)) = &redir.dest;
-                    let expanded = self.expand_words(std::slice::from_ref(file_word)).await?;
+                    let expanded = self.expand_words(slice::from_ref(file_word)).await?;
                     let [file_path] = &*expanded else {
                         return Err(Error::InvalidRedirectionTarget);
                     };
@@ -372,14 +374,90 @@ impl<'b> ExecContext<'_, 'b> {
         }
     }
 
-    async fn expand_words(&self, words: &[Word]) -> Result<Vec<String>> {
+    // TODO: Word and size limit.
+    async fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>> {
+        fn dfs(
+            ret: &mut Vec<String>,
+            stack: &mut String,
+            frags: &[WordFrag],
+            expanded: &[Vec<String>],
+        ) {
+            let Some((frag, rest_frags)) = frags.split_first() else {
+                ret.push(stack.clone());
+                return;
+            };
+            let prev_len = stack.len();
+            match frag {
+                WordFrag::Literal(s) => {
+                    stack.push_str(s);
+                    dfs(ret, stack, rest_frags, expanded);
+                    stack.truncate(prev_len);
+                }
+                WordFrag::Variable(_)
+                | WordFrag::VariableNoSplit(_)
+                | WordFrag::Command(_)
+                | WordFrag::CommandNoSplit(_)
+                | WordFrag::Brace(_) => {
+                    let (words, rest_computed) = expanded.split_first().unwrap();
+                    for w in words {
+                        stack.push_str(w);
+                        dfs(ret, stack, rest_frags, rest_computed);
+                        stack.truncate(prev_len);
+                    }
+                }
+                WordFrag::TildeSegment | WordFrag::Wildcard | WordFrag::WildcardRecursive => {
+                    todo!()
+                }
+            }
+        }
+
         let mut ret = Vec::new();
 
         for w in words {
-            match w {
-                Word::Simple(w) => ret.push(w.clone()),
-                Word::Complex(_) => todo!(),
+            let frags = match w {
+                Word::Simple(w) => {
+                    ret.push(w.clone());
+                    continue;
+                }
+                Word::Complex(frags) => frags,
+            };
+
+            let mut expanded = Vec::with_capacity(frags.len());
+            for frag in frags {
+                match frag {
+                    WordFrag::Literal(_) => {}
+                    WordFrag::Variable(var) | WordFrag::VariableNoSplit(var) => {
+                        let vals = self
+                            .get_var(var)
+                            .ok_or_else(|| Error::VariableNotFound(var.into()))?;
+                        if matches!(frag, WordFrag::Variable(_)) {
+                            expanded.push(vals.to_vec());
+                        } else {
+                            expanded.push(vec![vals.join(" ")]);
+                        }
+                    }
+                    WordFrag::Brace(words) => {
+                        let mut alts = Vec::with_capacity(words.len());
+                        for w in words {
+                            let mut vals = Box::pin(self.expand_words(slice::from_ref(w))).await?;
+                            if vals.len() != 1 {
+                                todo!();
+                            }
+                            alts.push(vals.pop().unwrap());
+                        }
+                        expanded.push(alts);
+                    }
+                    WordFrag::Command(_)
+                    | WordFrag::CommandNoSplit(_)
+                    | WordFrag::TildeSegment
+                    | WordFrag::Wildcard
+                    | WordFrag::WildcardRecursive => {
+                        todo!()
+                    }
+                }
             }
+
+            dfs(&mut ret, &mut String::new(), frags, &expanded);
         }
 
         Ok(ret)

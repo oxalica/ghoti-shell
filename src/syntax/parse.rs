@@ -3,12 +3,9 @@ use chumsky::combinator::Repeated;
 use chumsky::error::Rich;
 use chumsky::prelude::*;
 use chumsky::text::keyword;
+use either::Either;
 
 use super::*;
-
-const KEYWORDS: &[&str] = &[
-    "begin", "end", "if", "else", "switch", "case", "for", "in", "and", "or", "not",
-];
 
 type ParseErr<'i> = extra::Err<Rich<'i, char>>;
 
@@ -65,6 +62,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
         .labelled("statements")
         .boxed();
     let stmt_block = stmt_list.clone().map(Stmt::Block);
+    let word = word(stmt_block.clone());
 
     // Atomic statements.
 
@@ -96,9 +94,9 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
         .labelled("while statement");
 
     let for_stmt = keyword("for")
-        .ignore_then(word())
+        .ignore_then(word.clone())
         .then_ignore(keyword("in"))
-        .then(word().repeated().collect::<Vec<_>>())
+        .then(word.clone().repeated().collect::<Vec<_>>())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
@@ -106,14 +104,15 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
         .labelled("for statement");
 
     let function_stmt = keyword("function")
-        .ignore_then(word().repeated().at_least(1).collect::<Vec<_>>())
+        .ignore_then(word.clone().repeated().at_least(1).collect::<Vec<_>>())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
         .map(|(def, body)| Stmt::Function(def, Box::new(body)))
         .labelled("function statement");
 
-    let command_stmt = word()
+    let command_stmt = word
+        .clone()
         .then_ignore(none_of("<>|").ignored().rewind().or(end()))
         .separated_by(sp())
         .at_least(1)
@@ -141,8 +140,8 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
         just(">").to(RedirectMode::Write),
     ));
     let redirect_dest = choice((
-        just("&").ignore_then(word()).map(RedirectDest::Fd),
-        word().map(RedirectDest::File),
+        just("&").ignore_then(word.clone()).map(RedirectDest::Fd),
+        word.clone().map(RedirectDest::File),
     ));
     let redirects = sp()
         .ignore_then(text::digits(10).to_slice().or_not())
@@ -209,8 +208,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
 fn verbatim_word<'i>() -> impl Parser<'i, &'i str> {
     any()
         .filter(|c: &char| {
-            c.is_alphanumeric()
-                || matches!(c, '%' | '+' | ',' | '-' | '.' | '/' | ':' | '@' | '_' | '^')
+            c.is_alphanumeric() || matches!(c, '%' | '+' | '-' | '.' | '/' | ':' | '@' | '_' | '^')
         })
         .repeated()
         .at_least(1)
@@ -219,35 +217,105 @@ fn verbatim_word<'i>() -> impl Parser<'i, &'i str> {
         .labelled("verbatim word")
 }
 
-fn word<'i>() -> impl Parser<'i, Word> {
-    let escape = choice((
-        just("\\").ignore_then(one_of(" $\\*?~#()[]{}<>&|;\"'").to_slice()),
-        just("\\a").to("\x07"),
-        just("\\e").to("\x1b"),
-        just("\\n").to("\n"),
-        just("\\r").to("\r"),
-        // TODO: f, t, v, x, u, newline
-    ));
+fn word<'i>(stmt_block: impl Parser<'i, Stmt> + 'i) -> impl Parser<'i, Word> {
+    recursive(|word| {
+        let escape = choice((
+            just("\\").ignore_then(one_of(" $\\*?~#()[]{}<>&|;\"'").to_slice()),
+            just("\\a").to("\x07"),
+            just("\\e").to("\x1b"),
+            just("\\n").to("\n"),
+            just("\\r").to("\r"),
+            // TODO: f, t, v, x, u, newline
+        ));
 
-    let squoted = choice((
-        none_of("'\\").repeated().at_least(1).to_slice(),
-        just("\\\\").to("\\"),
-        just("\\'").to("'"),
-    ))
-    .delimited_by(just("'"), just("'"));
+        let squoted = choice((
+            none_of("'\\").repeated().at_least(1).to_slice(),
+            just("\\\\").to("\\"),
+            just("\\'").to("'"),
+        ))
+        .delimited_by(just("'"), just("'"));
 
-    let dquoted = choice((
-        // TODO: Escaped newline
-        none_of("\"\\$").repeated().at_least(1).to_slice(),
-        just("\\").ignore_then(one_of("\"\\$").to_slice()),
-    ))
-    .delimited_by(just("\""), just("\""));
+        let literal =
+            choice((verbatim_word(), escape, squoted)).map(|s| WordFrag::Literal(s.into()));
 
-    choice((verbatim_word(), escape, squoted, dquoted))
+        let variable = just("$").ignore_then(verbatim_word());
+
+        let command = stmt_block.delimited_by(just("$("), just(")"));
+
+        let dquoted = choice((
+            // TODO: Escaped newline
+            none_of("\"\\$")
+                .repeated()
+                .at_least(1)
+                .to_slice()
+                .map(|s: &str| WordFrag::Literal(s.into())),
+            just("\\")
+                .ignore_then(one_of("\"\\$").to_slice())
+                .map(|s: &str| WordFrag::Literal(s.into())),
+            variable
+                .clone()
+                .map(|w| WordFrag::VariableNoSplit(w.into())),
+            command.clone().map(WordFrag::CommandNoSplit),
+        ))
         .repeated()
-        .at_least(1)
         .collect::<Vec<_>>()
-        .map(|w: Vec<&str>| Word::Simple(w.iter().copied().collect::<String>()))
+        .delimited_by(just("\""), just("\""))
+        .boxed();
+
+        // TODO: Allow spaces inside.
+        let brace = word
+            .or_not()
+            .map(|w| w.unwrap_or(Word::Simple(String::new())))
+            .separated_by(just(","))
+            .collect::<Vec<_>>()
+            .map(WordFrag::Brace)
+            .delimited_by(just("{"), just("}"));
+
+        let star_star = just("**").to(WordFrag::WildcardRecursive);
+
+        let star = just("*")
+            .then(none_of("*").ignored().or(end()).rewind())
+            .to(WordFrag::Wildcard);
+
+        let mid_frags = choice((
+            literal,
+            command.map(WordFrag::Command),
+            variable.map(|s| WordFrag::Variable(s.into())),
+            brace,
+            star_star,
+            star,
+        ))
+        .boxed();
+
+        // TODO: Tilde
+
+        empty()
+            .to(Vec::new())
+            .foldl(
+                mid_frags
+                    .map(Either::Left)
+                    .or(dquoted.map(Either::Right))
+                    .repeated()
+                    .at_least(1),
+                |mut frags, f| {
+                    match f {
+                        Either::Left(f) => frags.push(f),
+                        Either::Right(fs) => frags.extend(fs),
+                    }
+                    frags
+                },
+            )
+            .map(|mut frags| match &*frags {
+                [] => Word::Simple(String::new()),
+                [WordFrag::Literal(_)] => {
+                    let Some(WordFrag::Literal(s)) = frags.pop() else {
+                        unreachable!()
+                    };
+                    Word::Simple(s)
+                }
+                _ => Word::Complex(frags),
+            })
+    })
 }
 
 #[cfg(test)]

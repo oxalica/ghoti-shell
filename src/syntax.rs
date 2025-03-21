@@ -4,6 +4,10 @@ use std::str::FromStr;
 
 pub mod parse;
 
+pub const KEYWORDS: &[&str] = &[
+    "begin", "end", "if", "else", "switch", "case", "for", "in", "and", "or", "not",
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFile {
     pub stmts: Vec<Stmt>,
@@ -101,11 +105,20 @@ pub type Words = Vec<Word>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Word {
     Simple(String),
-    Complex(Vec<WordFragment>),
+    Complex(Vec<WordFrag>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum WordFragment {
+pub enum WordFrag {
     Literal(String),
     Variable(String),
+    VariableNoSplit(String),
+    Command(Stmt),
+    CommandNoSplit(Stmt),
+
+    Brace(Vec<Word>),
+
+    TildeSegment,
+    Wildcard,
+    WildcardRecursive,
 }

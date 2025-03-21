@@ -6,11 +6,18 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use tokio::process::Command;
+use tokio::process::Command as OsCommand;
 
 use crate::syntax::{RedirectDest, RedirectMode, RedirectPort, Stmt, Word};
 
+pub mod builtins;
+mod utils;
+
+pub use utils::*;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub type ExecResult<T = ()> = Result<T>;
 
 pub type Bytes = Vec<u8>;
 
@@ -19,6 +26,13 @@ pub enum Error {
     #[error("command exited with {0}")]
     ExitCode(i32),
 
+    #[error("{0}")]
+    Custom(String),
+
+    #[error("invalid identifier: {0:?}")]
+    InvalidateIdentifier(String),
+    #[error("expecting an identifier, found a list with {0} elements")]
+    InvalidateIdentifierWords(usize),
     #[error("empty command")]
     EmptyCommand,
     #[error("command not found: {0:?}")]
@@ -38,23 +52,6 @@ pub enum Error {
     WaitProcess(std::io::Error),
 }
 
-pub type BuiltinCmd = Box<dyn Fn(&[String], Io) -> Pin<Box<dyn Future<Output = ExecResult>>>>;
-
-#[derive(Default)]
-pub struct Executor {
-    builtins: HashMap<String, BuiltinCmd>,
-}
-
-impl fmt::Debug for Executor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Executor")
-            .field("builtins", &self.builtins.keys())
-            .finish()
-    }
-}
-
-type ExecResult = Result<()>;
-
 #[derive(Default, Debug, Clone)]
 pub struct Io {
     pub stdin: Stdio,
@@ -70,24 +67,145 @@ pub enum Stdio {
     Raw(Rc<OwnedFd>),
 }
 
+#[derive(Debug)]
+pub struct Executor {
+    builtin_funcs: HashMap<String, Command>,
+}
+
+impl Default for Executor {
+    fn default() -> Self {
+        Self {
+            // TODO: Avoid string allocations.
+            builtin_funcs: builtins::ALL_BUILTINS
+                .into_iter()
+                .map(|(name, cmd)| (name.to_owned(), cmd))
+                .collect(),
+        }
+    }
+}
+
 impl Executor {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            builtin_funcs: HashMap::new(),
+        }
     }
 
-    pub fn add_builtin(&mut self, name: impl Into<String>, cmd: BuiltinCmd) -> Option<BuiltinCmd> {
-        self.builtins.insert(name.into(), cmd)
+    pub fn add_builtin_func(&mut self, name: String, cmd: Command) {
+        self.builtin_funcs.insert(name, cmd);
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecContext<'a, 'b> {
+    funcs: HashMap<String, Option<Command>>,
+    vars: HashMap<String, Option<Vec<String>>>,
+    root: &'b Executor,
+    outer: Option<&'a ExecContext<'a, 'b>>,
+}
+
+impl<'b> ExecContext<'_, 'b> {
+    pub fn new(root: &'b Executor) -> Self {
+        Self {
+            funcs: HashMap::new(),
+            vars: HashMap::new(),
+            root,
+            outer: None,
+        }
     }
 
-    pub fn get_builtin(&self, name: &str) -> Option<&BuiltinCmd> {
-        self.builtins.get(name)
+    pub fn fork(&self) -> ExecContext<'_, 'b> {
+        ExecContext {
+            funcs: HashMap::new(),
+            vars: HashMap::new(),
+            root: self.root,
+            outer: Some(self),
+        }
     }
 
-    fn exec_stmt_boxed(&self, stmt: &Stmt, io: Io) -> impl Future<Output = ExecResult> {
+    pub fn cut<'c>(self) -> ExecContext<'c, 'b> {
+        ExecContext {
+            funcs: self.funcs,
+            vars: self.vars,
+            root: self.root,
+            outer: None,
+        }
+    }
+
+    async fn fork_exec(&self, stmt: &Stmt, io: Io) -> (ExecContext<'_, 'b>, ExecResult) {
+        let mut subctx = self.fork();
+        let ret = subctx.exec_stmt(stmt, io).await;
+        (subctx, ret)
+    }
+
+    pub fn merge(&mut self, rhs: ExecContext<'_, '_>) {
+        for (name, cmd) in rhs.funcs {
+            match cmd {
+                Some(cmd) => self.set_func(name, cmd),
+                None => self.remove_func(&name),
+            }
+        }
+        for (name, vals) in rhs.vars {
+            match vals {
+                Some(vals) => self.set_var(name, vals),
+                None => self.remove_var(&name),
+            }
+        }
+    }
+
+    pub fn get_func(&self, name: &str) -> Option<&Command> {
+        match (self.funcs.get(name), self.outer) {
+            // Defined locally.
+            (Some(Some(cmd)), _) => Some(cmd),
+            // Inherited.
+            (None, Some(outer)) => outer.get_func(name),
+            // Unset locally, or not set at all.
+            (Some(None), _) | (None, None) => self.root.builtin_funcs.get(name),
+        }
+    }
+
+    pub fn set_func(&mut self, name: impl Into<String>, cmd: Command) {
+        self.funcs.insert(name.into(), Some(cmd));
+    }
+
+    pub fn remove_func(&mut self, name: &str) {
+        if self.outer.is_none() {
+            self.funcs.remove(name);
+        } else {
+            self.funcs.insert(name.to_owned(), None);
+        }
+    }
+
+    pub fn get_var(&self, name: &str) -> Option<&[String]> {
+        match (self.vars.get(name), self.outer) {
+            // Defined locally.
+            (Some(Some(vals)), _) => Some(vals),
+            // Inherited.
+            (None, Some(outer)) => outer.get_var(name),
+            // Unset locally, or not set at all.
+            // TODO: Builtin variables.
+            (Some(None), _) | (None, None) => None,
+        }
+    }
+
+    pub fn set_var(&mut self, name: impl Into<String>, values: impl IntoIterator<Item = String>) {
+        self.vars
+            .insert(name.into(), Some(values.into_iter().collect()));
+    }
+
+    pub fn remove_var(&mut self, name: &str) {
+        if self.outer.is_none() {
+            self.vars.remove(name);
+        } else {
+            self.vars.insert(name.to_owned(), None);
+        }
+    }
+
+    fn exec_stmt_boxed(&mut self, stmt: &Stmt, io: Io) -> impl Future<Output = ExecResult> {
         Box::pin(self.exec_stmt(stmt, io))
     }
 
-    pub async fn exec_stmts(&self, stmts: &[Stmt], io: Io) -> ExecResult {
+    pub async fn exec_stmts(&mut self, stmts: &[Stmt], io: Io) -> ExecResult {
         let Some((last, init)) = stmts.split_last() else {
             return Ok(());
         };
@@ -97,7 +215,7 @@ impl Executor {
         self.exec_stmt(last, io).await
     }
 
-    pub async fn exec_stmt(&self, stmt: &Stmt, mut io: Io) -> ExecResult {
+    pub async fn exec_stmt(&mut self, stmt: &Stmt, mut io: Io) -> ExecResult {
         match stmt {
             Stmt::Command(words) => {
                 let words = self.expand_words(words).await?;
@@ -118,7 +236,16 @@ impl Executor {
                 self.exec_stmt_boxed(cond, io.clone()).await?;
                 let _ret = self.exec_stmt_boxed(body, io.clone()).await;
             },
-            Stmt::For(..) => todo!(),
+            Stmt::For(var, elem_ws, body) => {
+                let var = self.expand_words(std::slice::from_ref(var)).await?;
+                let var = validate_variable_words(&var)?;
+                let elems = self.expand_words(elem_ws).await?;
+                for elem in elems {
+                    self.set_var(var, [elem]);
+                    self.exec_stmt_boxed(body, io.clone()).await?;
+                }
+                Ok(())
+            }
             Stmt::Function(..) => todo!(),
             Stmt::Redirect(stmt, redirects) => {
                 for redir in redirects {
@@ -172,11 +299,14 @@ impl Executor {
                     ..io.clone()
                 };
 
-                let (_ret_l, ret_r) = tokio::join!(
-                    self.exec_stmt_boxed(lhs, lhs_io),
-                    self.exec_stmt_boxed(rhs, rhs_io),
+                let ((ctx1, _ret1), (ctx2, ret2)) = tokio::join!(
+                    Box::pin(self.fork_exec(lhs, lhs_io)),
+                    Box::pin(self.fork_exec(rhs, rhs_io)),
                 );
-                ret_r
+                let (ctx1, ctx2) = (ctx1.cut(), ctx2.cut());
+                self.merge(ctx1);
+                self.merge(ctx2);
+                ret2
             }
             Stmt::Not(stmt) => match self.exec_stmt_boxed(stmt, io).await {
                 Ok(()) => Err(Error::ExitCode(0)),
@@ -193,11 +323,13 @@ impl Executor {
         }
     }
 
-    pub async fn exec_cmd(&self, words: &[String], io: Io) -> ExecResult {
+    pub async fn exec_cmd(&mut self, words: &[String], io: Io) -> ExecResult {
         let cmd = words.first().ok_or(Error::EmptyCommand)?;
 
-        if let Some(builtin) = self.builtins.get(cmd) {
-            return builtin(words, io).await;
+        // NB. The command borrows `self` but may modify the `self` during execution.
+        // We need to clone it first.
+        if let Some(cmd) = self.get_func(cmd).cloned() {
+            return cmd.exec(self, words, io).await;
         }
 
         self.exec_external_cmd(words, io).await
@@ -218,7 +350,7 @@ impl Executor {
             })
         };
 
-        let mut child = Command::new(cmd)
+        let mut child = OsCommand::new(cmd)
             .args(args)
             .stdin(cvt_stdio(io.stdin)?)
             .stdout(cvt_stdio(io.stdout)?)
@@ -251,5 +383,61 @@ impl Executor {
         }
 
         Ok(ret)
+    }
+}
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
+pub trait DynCommand:
+    'static
+    + dyn_clone::DynClone
+    + for<'e, 'a, 'b> Fn(&'e mut ExecContext<'a, 'b>, &'e [String], Io) -> BoxFuture<'e, ExecResult>
+{
+}
+impl<F> DynCommand for F where
+    F: ?Sized
+        + 'static
+        + dyn_clone::DynClone
+        + for<'e, 'a, 'b> Fn(
+            &'e mut ExecContext<'a, 'b>,
+            &'e [String],
+            Io,
+        ) -> BoxFuture<'e, ExecResult>
+{
+}
+
+dyn_clone::clone_trait_object!(DynCommand);
+
+#[derive(Clone)]
+pub struct Command {
+    func: Box<dyn DynCommand>,
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command").finish_non_exhaustive()
+    }
+}
+
+impl Command {
+    pub const fn new(func: Box<dyn DynCommand>) -> Self {
+        Self { func }
+    }
+
+    const fn new_zst_fn<F: DynCommand + Copy>(_func: F) -> Self {
+        const { assert!(size_of::<F>() == 0) };
+        // SAFETY: `Box<ZST>` can be constructed via a aligned non-null dangling pointer.
+        // Ref: <https://doc.rust-lang.org/stable/std/boxed/index.html#memory-layout>
+        let b = unsafe { std::mem::transmute::<*mut F, Box<F>>(std::ptr::dangling_mut()) };
+        Self::new(b)
+    }
+
+    pub fn exec<'e, 'a, 'b>(
+        &self,
+        ctx: &'e mut ExecContext<'a, 'b>,
+        args: &'e [String],
+        io: Io,
+    ) -> impl Future<Output = ExecResult> + use<'e, 'a, 'b> {
+        (self.func)(ctx, args, io)
     }
 }

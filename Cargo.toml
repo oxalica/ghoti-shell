@@ -7,6 +7,7 @@ license = "GPL-2.0-only"
 [dependencies]
 anyhow = "1.0.97"
 chumsky = { version = "1.0.0-alpha.8", features = ["pratt"] }
+dyn-clone = "1.0.19"
 os_pipe = "1.2.1"
 rustyline = "15.0.0"
 thiserror = "2.0.12"

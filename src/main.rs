@@ -1,11 +1,12 @@
 use chumsky::Parser;
-use ghoti_shell::exec::{Error, Executor, Io};
+use ghoti_shell::exec::{Error, ExecContext, Executor, Io};
 use ghoti_shell::syntax::parse::source_file;
 use rustyline::error::ReadlineError;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = rustyline::DefaultEditor::new()?;
-    let exec = Executor::new();
+    let exec = Executor::default();
+    let mut ctx = ExecContext::new(&exec);
 
     let mut last_status = 0;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -37,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let ret = rt.block_on(exec.exec_stmts(&src.stmts, Io::default()));
+        let ret = rt.block_on(ctx.exec_stmts(&src.stmts, Io::default()));
         // Prevent next prompt from clobbering the output if it contains no newline.
         println!();
 

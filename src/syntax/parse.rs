@@ -220,7 +220,34 @@ fn verbatim_word<'i>() -> impl Parser<'i, &'i str> {
 }
 
 fn word<'i>() -> impl Parser<'i, Word> {
-    verbatim_word().map(|w| Word::Simple(w.to_owned()))
+    let escape = choice((
+        just("\\").ignore_then(one_of(" $\\*?~#()[]{}<>&|;\"'").to_slice()),
+        just("\\a").to("\x07"),
+        just("\\e").to("\x1b"),
+        just("\\n").to("\n"),
+        just("\\r").to("\r"),
+        // TODO: f, t, v, x, u, newline
+    ));
+
+    let squoted = choice((
+        none_of("'\\").repeated().at_least(1).to_slice(),
+        just("\\\\").to("\\"),
+        just("\\'").to("'"),
+    ))
+    .delimited_by(just("'"), just("'"));
+
+    let dquoted = choice((
+        // TODO: Escaped newline
+        none_of("\"\\$").repeated().at_least(1).to_slice(),
+        just("\\").ignore_then(one_of("\"\\$").to_slice()),
+    ))
+    .delimited_by(just("\""), just("\""));
+
+    choice((verbatim_word(), escape, squoted, dquoted))
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map(|w: Vec<&str>| Word::Simple(w.iter().copied().collect::<String>()))
 }
 
 #[cfg(test)]

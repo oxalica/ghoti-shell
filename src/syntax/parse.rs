@@ -19,13 +19,20 @@ impl<'i, T, P> Parser<'i, T> for P where
 }
 
 pub fn source_file<'i>() -> impl chumsky::Parser<'i, &'i str, SourceFile, ParseErr<'i>> {
-    stmt_and_list().1.map(|stmts| SourceFile { stmts })
+    let (stmt, list) = stmt_and_list();
+    list.then(stmt.or_not())
+        .then_ignore(end())
+        .map(|(mut stmts, s)| {
+            stmts.extend(s);
+            SourceFile { stmts }
+        })
 }
 
 fn sp<'i>() -> Repeated<impl Parser<'i, ()>, (), &'i str, ParseErr<'i>> {
     just(' ')
         .or(just('#').then_ignore(any().and_is(none_of("\n")).repeated()))
         .ignored()
+        .labelled("space")
         .repeated()
         .at_least(1)
 }
@@ -36,22 +43,26 @@ fn eos<'i>() -> impl Parser<'i, ()> {
         just("\r\n").ignored(),
         just(';').ignored(),
     ))
+    .labelled("end of statement")
 }
 
 fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
     let mut stmt = Recursive::declare();
 
-    let maybe_stmt = stmt
-        .clone()
-        .or_not()
-        .padded_by(sp().at_least(0))
-        .then_ignore(eos());
     let stmt_list = empty()
         .to(Vec::new())
-        .foldl(maybe_stmt.repeated(), |mut v, s| {
-            v.extend(s);
-            v
-        })
+        .foldl(
+            stmt.clone()
+                .or_not()
+                .padded_by(sp().at_least(0))
+                .then_ignore(eos())
+                .repeated(),
+            |mut v, s| {
+                v.extend(s);
+                v
+            },
+        )
+        .labelled("statements")
         .boxed();
     let stmt_block = stmt_list.clone().map(Stmt::Block);
 
@@ -73,37 +84,42 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
             .map(|((cond, then), else_)| {
                 Stmt::If(Box::new(cond), Box::new(then), else_.map(Box::new))
             })
-    });
+    })
+    .labelled("if statement");
 
     let while_stmt = keyword("while")
         .ignore_then(stmt.clone())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
-        .map(|(cond, body)| Stmt::While(Box::new(cond), Box::new(body)));
+        .map(|(cond, body)| Stmt::While(Box::new(cond), Box::new(body)))
+        .labelled("while statement");
 
     let for_stmt = keyword("for")
-        .ignore_then(ident_word())
+        .ignore_then(word())
         .then_ignore(keyword("in"))
         .then(word().repeated().collect::<Vec<_>>())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
-        .map(|((var, list), body)| Stmt::For(var.to_owned(), list, Box::new(body)));
+        .map(|((var, list), body)| Stmt::For(var, list, Box::new(body)))
+        .labelled("for statement");
 
     let function_stmt = keyword("function")
         .ignore_then(word().repeated().at_least(1).collect::<Vec<_>>())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
-        .map(|(def, body)| Stmt::Function(def, Box::new(body)));
+        .map(|(def, body)| Stmt::Function(def, Box::new(body)))
+        .labelled("function statement");
 
     let command_stmt = word()
-        .then_ignore(none_of("<>|").rewind())
+        .then_ignore(none_of("<>|").ignored().rewind().or(end()))
         .separated_by(sp())
         .at_least(1)
         .collect::<Vec<_>>()
-        .map(Stmt::Command);
+        .map(Stmt::Command)
+        .labelled("command");
 
     let atom_stmt = choice((
         if_stmt,
@@ -141,6 +157,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
             };
             Ok(Redirect { port, mode, dest })
         })
+        .labelled("redirection")
         .repeated()
         .at_least(1)
         .collect::<Vec<Redirect>>();
@@ -153,47 +170,57 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
             .then_ignore(just(">|"))
             .try_map(|fd: &str, span| fd.parse().map_err(|err| Rich::custom(span, err))),
     ))
+    .labelled("pipe operator")
     .padded_by(sp());
 
     stmt.define({
         use chumsky::pratt::*;
 
-        atom_stmt.pratt((
-            postfix(5, redirects, |s, redirs, _| {
-                Stmt::Redirect(Box::new(s), redirs)
-            }),
-            prefix(
-                4,
-                choice((just("!"), keyword("not"))).then(sp()),
-                |_, s, _| Stmt::Not(Box::new(s)),
-            ),
-            infix(right(3), pipe_op, |l, port, r, _| {
-                Stmt::Pipe(port, Box::new(l), Box::new(r))
-            }),
-            infix(
-                right(2),
-                choice((just("&&"), keyword("and"))).padded_by(sp()),
-                |l, _, r, _| Stmt::And(Box::new(l), Box::new(r)),
-            ),
-            infix(
-                right(1),
-                choice((just("||"), keyword("or"))).padded_by(sp()),
-                |l, _, r, _| Stmt::Or(Box::new(l), Box::new(r)),
-            ),
-        ))
+        atom_stmt
+            .pratt((
+                postfix(5, redirects, |s, redirs, _| {
+                    Stmt::Redirect(Box::new(s), redirs)
+                }),
+                prefix(
+                    4,
+                    choice((just("!"), keyword("not"))).then(sp()),
+                    |_, s, _| Stmt::Not(Box::new(s)),
+                ),
+                infix(right(3), pipe_op, |l, port, r, _| {
+                    Stmt::Pipe(port, Box::new(l), Box::new(r))
+                }),
+                infix(
+                    right(2),
+                    choice((just("&&"), keyword("and"))).padded_by(sp()),
+                    |l, _, r, _| Stmt::And(Box::new(l), Box::new(r)),
+                ),
+                infix(
+                    right(1),
+                    choice((just("||"), keyword("or"))).padded_by(sp()),
+                    |l, _, r, _| Stmt::Or(Box::new(l), Box::new(r)),
+                ),
+            ))
+            .labelled("statement pipeline")
     });
 
     (stmt, stmt_list)
 }
 
-fn ident_word<'i>() -> impl Parser<'i, &'i str> {
-    text::ident().map(|s: &str| s)
+fn verbatim_word<'i>() -> impl Parser<'i, &'i str> {
+    any()
+        .filter(|c: &char| {
+            c.is_alphanumeric()
+                || matches!(c, '%' | '+' | ',' | '-' | '.' | '/' | ':' | '@' | '_' | '^')
+        })
+        .repeated()
+        .at_least(1)
+        .to_slice()
+        .filter(|w: &&str| !KEYWORDS.contains(w))
+        .labelled("verbatim word")
 }
 
 fn word<'i>() -> impl Parser<'i, Word> {
-    text::ident()
-        .filter(|w: &&str| !KEYWORDS.contains(w))
-        .map(|w| Word::Simple(w.to_owned()))
+    verbatim_word().map(|w| Word::Simple(w.to_owned()))
 }
 
 #[cfg(test)]

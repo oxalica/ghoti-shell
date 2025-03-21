@@ -15,7 +15,7 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     If(Box<Stmt>, Box<Stmt>, Option<Box<Stmt>>),
     While(Box<Stmt>, Box<Stmt>),
-    For(String, Words, Box<Stmt>),
+    For(Word, Words, Box<Stmt>),
     Function(Words, Box<Stmt>),
 
     Redirect(Box<Stmt>, Vec<Redirect>),

@@ -12,5 +12,5 @@ either = "1.15.0"
 os_pipe = "1.2.1"
 rustyline = "15.0.0"
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["macros", "process", "rt"] }
+tokio = { version = "1.44.1", features = ["io-util", "macros", "process", "rt"] }
 tracing = "0.1.41"

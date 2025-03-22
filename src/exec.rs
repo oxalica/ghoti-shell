@@ -1,12 +1,12 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::{fmt, slice};
-
-use tokio::process::Command as OsCommand;
 
 use crate::syntax::{RedirectDest, RedirectMode, RedirectPort, Stmt, Word, WordFrag};
 
@@ -28,6 +28,8 @@ pub enum Error {
 
     #[error("{0}")]
     Custom(String),
+    #[error("io error: {0}")]
+    Io(std::io::Error),
 
     #[error("invalid identifier: {0:?}")]
     InvalidateIdentifier(String),
@@ -40,18 +42,20 @@ pub enum Error {
     #[error("invalid redirection target")]
     InvalidRedirectionTarget,
     #[error("failed open redirection file {0:?}: {1}")]
-    OpenRedirectionFile(PathBuf, std::io::Error),
+    OpenRedirectionFile(PathBuf, io::Error),
     #[error("failed to spawn process {0:?}: {1}")]
-    SpawnProcess(PathBuf, std::io::Error),
+    SpawnProcess(PathBuf, io::Error),
     #[error("variable not found: {0:?}")]
     VariableNotFound(String),
+    #[error("pipe closed")]
+    PipeClosed,
 
     #[error("failed to create pipe: {0}")]
-    CreatePipe(std::io::Error),
+    CreatePipe(io::Error),
     #[error("failed to clone fd: {0}")]
-    CloneHandle(std::io::Error),
+    CloneHandle(io::Error),
     #[error("failed to wait process: {0}")]
-    WaitProcess(std::io::Error),
+    WaitProcess(io::Error),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -61,12 +65,41 @@ pub struct Io {
     pub stderr: Stdio,
 }
 
-#[derive(Default, Debug, Clone)]
+pub type StdioCollectSink = Rc<dyn Fn(&[u8]) -> ExecResult>;
+
+#[derive(Default, Clone)]
 pub enum Stdio {
     #[default]
     Inherit,
     Close,
+    Collect(StdioCollectSink),
     Raw(Rc<OwnedFd>),
+}
+
+impl fmt::Debug for Stdio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inherit => write!(f, "Inherit"),
+            Self::Close => write!(f, "Close"),
+            Self::Collect(_) => f.debug_tuple("Collect").finish_non_exhaustive(),
+            Self::Raw(fd) => f.debug_tuple("Raw").field(fd).finish(),
+        }
+    }
+}
+
+impl Io {
+    pub fn write_stdout(&self, s: impl fmt::Display) -> ExecResult {
+        match &self.stdout {
+            // FIXME: how to async write stdout?
+            Stdio::Inherit => std::io::stdout()
+                .lock()
+                .write_fmt(format_args!("{s}"))
+                .map_err(Error::Io),
+            Stdio::Close => Err(Error::PipeClosed),
+            Stdio::Collect(sink) => sink(s.to_string().as_bytes()),
+            Stdio::Raw(_) => todo!(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -155,6 +188,17 @@ impl<'b> ExecContext<'_, 'b> {
         }
     }
 
+    pub fn builtin_funcs(&self) -> impl ExactSizeIterator<Item = (&str, &Command)> {
+        self.root
+            .builtin_funcs
+            .iter()
+            .map(|(name, cmd)| (&**name, cmd))
+    }
+
+    pub fn get_builtin_func(&self, name: &str) -> Option<&Command> {
+        self.root.builtin_funcs.get(name)
+    }
+
     pub fn get_func(&self, name: &str) -> Option<&Command> {
         match (self.funcs.get(name), self.outer) {
             // Defined locally.
@@ -162,7 +206,7 @@ impl<'b> ExecContext<'_, 'b> {
             // Inherited.
             (None, Some(outer)) => outer.get_func(name),
             // Unset locally, or not set at all.
-            (Some(None), _) | (None, None) => self.root.builtin_funcs.get(name),
+            (Some(None), _) | (None, None) => self.get_builtin_func(name),
         }
     }
 
@@ -326,52 +370,15 @@ impl<'b> ExecContext<'_, 'b> {
     }
 
     pub async fn exec_cmd(&mut self, words: &[String], io: Io) -> ExecResult {
-        let cmd = words.first().ok_or(Error::EmptyCommand)?;
+        let (cmd, args) = words.split_first().ok_or(Error::EmptyCommand)?;
 
         // NB. The command borrows `self` but may modify the `self` during execution.
         // We need to clone it first.
         if let Some(cmd) = self.get_func(cmd).cloned() {
-            return cmd.exec(self, words, io).await;
+            return cmd.exec(self, args, io).await;
         }
 
-        self.exec_external_cmd(words, io).await
-    }
-
-    pub async fn exec_external_cmd(&self, words: &[String], io: Io) -> ExecResult {
-        use std::process::Stdio as ProcessStdio;
-
-        let (cmd, args) = words.split_first().ok_or(Error::EmptyCommand)?;
-
-        let cvt_stdio = |s: Stdio| {
-            Ok(match s {
-                Stdio::Inherit => ProcessStdio::inherit(),
-                Stdio::Close => todo!(),
-                Stdio::Raw(raw) => Rc::try_unwrap(raw)
-                    .or_else(|raw| raw.try_clone().map_err(Error::CloneHandle))?
-                    .into(),
-            })
-        };
-
-        let mut child = OsCommand::new(cmd)
-            .args(args)
-            .stdin(cvt_stdio(io.stdin)?)
-            .stdout(cvt_stdio(io.stdout)?)
-            .stderr(cvt_stdio(io.stderr)?)
-            .spawn()
-            .map_err(|err| Error::SpawnProcess(cmd.into(), err))?;
-        let status = child.wait().await.map_err(Error::WaitProcess)?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            #[cfg(unix)]
-            let code = {
-                use std::os::unix::process::ExitStatusExt;
-                status.into_raw()
-            };
-
-            Err(Error::ExitCode(code))
-        }
+        builtins::command(self, words, io).await
     }
 
     // TODO: Word and size limit.
@@ -436,6 +443,34 @@ impl<'b> ExecContext<'_, 'b> {
                             expanded.push(vec![vals.join(" ")]);
                         }
                     }
+                    WordFrag::Command(stmt) | WordFrag::CommandNoSplit(stmt) => {
+                        let buf = Rc::new(RefCell::new(Vec::new()));
+                        let buf_weak = Rc::downgrade(&buf);
+                        let io = Io {
+                            // FIXME: Avoid double Rc?
+                            stdout: Stdio::Collect(Rc::new(move |bytes| {
+                                buf_weak
+                                    .upgrade()
+                                    .ok_or(Error::PipeClosed)?
+                                    .borrow_mut()
+                                    .extend_from_slice(bytes);
+                                Ok(())
+                            })),
+                            ..Io::default()
+                        };
+                        // TODO: check status?
+                        let _ret = self.exec_stmt_boxed(stmt, io).await;
+                        let buf = Rc::into_inner(buf).unwrap().into_inner();
+                        let mut buf = String::from_utf8(buf).expect("TODO");
+
+                        if let WordFrag::CommandNoSplit(_) = frag {
+                            let len = buf.trim_end_matches('\n').len();
+                            buf.truncate(len);
+                            expanded.push(vec![buf]);
+                        } else {
+                            expanded.push(buf.lines().map(|s| s.to_owned()).collect());
+                        }
+                    }
                     WordFrag::Brace(words) => {
                         let mut alts = Vec::with_capacity(words.len());
                         for w in words {
@@ -447,11 +482,7 @@ impl<'b> ExecContext<'_, 'b> {
                         }
                         expanded.push(alts);
                     }
-                    WordFrag::Command(_)
-                    | WordFrag::CommandNoSplit(_)
-                    | WordFrag::TildeSegment
-                    | WordFrag::Wildcard
-                    | WordFrag::WildcardRecursive => {
+                    WordFrag::TildeSegment | WordFrag::Wildcard | WordFrag::WildcardRecursive => {
                         todo!()
                     }
                 }

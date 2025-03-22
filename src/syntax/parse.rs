@@ -35,30 +35,21 @@ fn sp<'i>() -> Repeated<impl Parser<'i, ()>, (), &'i str, ParseErr<'i>> {
 }
 
 fn eos<'i>() -> impl Parser<'i, ()> {
-    choice((
-        just("\n").ignored(),
-        just("\r\n").ignored(),
-        just(';').ignored(),
-    ))
-    .labelled("end of statement")
+    choice((just("\n"), just("\r\n"), just(";")))
+        .ignored()
+        .labelled("end of statement")
 }
 
 fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
     let mut stmt = Recursive::declare();
 
-    let stmt_list = empty()
-        .to(Vec::new())
-        .foldl(
-            stmt.clone()
-                .or_not()
-                .padded_by(sp().at_least(0))
-                .then_ignore(eos())
-                .repeated(),
-            |mut v, s| {
-                v.extend(s);
-                v
-            },
-        )
+    let stmt_list = stmt
+        .clone()
+        .padded_by(sp().at_least(0))
+        .separated_by(eos().separated_by(sp().at_least(0)))
+        .allow_leading()
+        .allow_trailing()
+        .collect()
         .labelled("statements")
         .boxed();
     let stmt_block = stmt_list.clone().map(Stmt::Block);
@@ -252,10 +243,10 @@ fn word<'i>(stmt_block: impl Parser<'i, Stmt> + 'i) -> impl Parser<'i, Word> {
             just("\\")
                 .ignore_then(one_of("\"\\$").to_slice())
                 .map(|s: &str| WordFrag::Literal(s.into())),
+            command.clone().map(WordFrag::CommandNoSplit),
             variable
                 .clone()
                 .map(|w| WordFrag::VariableNoSplit(w.into())),
-            command.clone().map(WordFrag::CommandNoSplit),
         ))
         .repeated()
         .collect::<Vec<_>>()

@@ -15,7 +15,7 @@ macro_rules! def_all_builtins {
             $(
                 (
                     stringify!($f),
-                    Command::new_zst_fn(|ctx, args, io| Box::pin($f(ctx, args, io))),
+                    Command::new_zst_fn(|ctx, args, io| Box::pin($f(ctx, args, io)) as _),
                 ),
             )*
         ];

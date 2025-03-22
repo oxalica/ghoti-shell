@@ -46,7 +46,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
     let stmt_list = stmt
         .clone()
         .padded_by(sp().at_least(0))
-        .separated_by(eos().separated_by(sp().at_least(0)))
+        .separated_by(eos().separated_by(sp().at_least(0)).allow_trailing())
         .allow_leading()
         .allow_trailing()
         .collect()
@@ -54,6 +54,11 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
         .boxed();
     let stmt_block = stmt_list.clone().map(Stmt::Block);
     let word = word(stmt_block.clone());
+    let word_list = word
+        .clone()
+        .separated_by(sp())
+        .allow_leading()
+        .allow_trailing();
 
     // Atomic statements.
 
@@ -87,7 +92,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
     let for_stmt = keyword("for")
         .ignore_then(word.clone())
         .then_ignore(keyword("in"))
-        .then(word.clone().repeated().collect::<Vec<_>>())
+        .then(word_list.clone().collect())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
@@ -95,7 +100,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
         .labelled("for statement");
 
     let function_stmt = keyword("function")
-        .ignore_then(word.clone().repeated().at_least(1).collect::<Vec<_>>())
+        .ignore_then(word_list.at_least(1).collect())
         .then_ignore(eos())
         .then(stmt_block.clone())
         .then_ignore(keyword("end"))
@@ -163,7 +168,7 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
     .labelled("pipe operator")
     .padded_by(sp());
 
-    stmt.define({
+    let logic_stmt = {
         use chumsky::pratt::*;
 
         atom_stmt
@@ -191,7 +196,9 @@ fn stmt_and_list<'i>() -> (impl Parser<'i, Stmt>, impl Parser<'i, Vec<Stmt>>) {
                 ),
             ))
             .labelled("statement pipeline")
-    });
+    };
+
+    stmt.define(logic_stmt.padded_by(sp().at_least(0)));
 
     (stmt, stmt_list)
 }

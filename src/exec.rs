@@ -292,7 +292,16 @@ impl<'b> ExecContext<'_, 'b> {
                 }
                 Ok(())
             }
-            Stmt::Function(..) => todo!(),
+            Stmt::Function(words, stmt) => {
+                let words = &*self.expand_words(words).await?;
+                let [name] = words else {
+                    return Err(Error::InvalidateIdentifierWords(words.len()));
+                };
+                validate_function_name(name)?;
+                let func_cmd = Command::new_function((**stmt).clone());
+                self.set_func(name, func_cmd);
+                Ok(())
+            }
             Stmt::Redirect(stmt, redirects) => {
                 for redir in redirects {
                     let (RedirectDest::File(file_word) | RedirectDest::Fd(file_word)) = &redir.dest;
@@ -497,22 +506,33 @@ impl<'b> ExecContext<'_, 'b> {
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-pub trait DynCommand:
-    'static
-    + dyn_clone::DynClone
-    + for<'e, 'a, 'b> Fn(&'e mut ExecContext<'a, 'b>, &'e [String], Io) -> BoxFuture<'e, ExecResult>
-{
+pub trait DynCommand: 'static + dyn_clone::DynClone {
+    fn exec<'fut>(
+        &'fut self,
+        ctx: &'fut mut ExecContext<'_, '_>,
+        args: &'fut [String],
+        io: Io,
+    ) -> BoxFuture<'fut, ExecResult>;
 }
-impl<F> DynCommand for F where
-    F: ?Sized
-        + 'static
-        + dyn_clone::DynClone
+
+impl<F> DynCommand for F
+where
+    F: 'static
+        + Clone
         + for<'e, 'a, 'b> Fn(
             &'e mut ExecContext<'a, 'b>,
             &'e [String],
             Io,
-        ) -> BoxFuture<'e, ExecResult>
+        ) -> BoxFuture<'e, ExecResult>,
 {
+    fn exec<'fut>(
+        &'fut self,
+        ctx: &'fut mut ExecContext<'_, '_>,
+        args: &'fut [String],
+        io: Io,
+    ) -> BoxFuture<'fut, ExecResult> {
+        self(ctx, args, io)
+    }
 }
 
 dyn_clone::clone_trait_object!(DynCommand);
@@ -533,7 +553,16 @@ impl Command {
         Self { func }
     }
 
-    const fn new_zst_fn<F: DynCommand + Copy>(_func: F) -> Self {
+    const fn new_zst_fn<F>(_func: F) -> Self
+    where
+        F: 'static
+            + Copy
+            + for<'e, 'a, 'b> Fn(
+                &'e mut ExecContext<'a, 'b>,
+                &'e [String],
+                Io,
+            ) -> BoxFuture<'e, ExecResult>,
+    {
         const { assert!(size_of::<F>() == 0) };
         // SAFETY: `Box<ZST>` can be constructed via a aligned non-null dangling pointer.
         // Ref: <https://doc.rust-lang.org/stable/std/boxed/index.html#memory-layout>
@@ -541,12 +570,33 @@ impl Command {
         Self::new(b)
     }
 
-    pub fn exec<'e, 'a, 'b>(
-        &self,
-        ctx: &'e mut ExecContext<'a, 'b>,
-        args: &'e [String],
+    pub fn new_function(stmt: Stmt) -> Self {
+        #[derive(Clone)]
+        struct Func(Rc<Stmt>);
+
+        impl DynCommand for Func {
+            fn exec<'fut>(
+                &'fut self,
+                ctx: &'fut mut ExecContext<'_, '_>,
+                args: &'fut [String],
+                io: Io,
+            ) -> BoxFuture<'fut, ExecResult> {
+                if !args.is_empty() {
+                    todo!();
+                }
+                Box::pin(ctx.exec_stmt(&self.0, io))
+            }
+        }
+
+        Self::new(Box::new(Func(Rc::new(stmt))))
+    }
+
+    pub fn exec<'fut>(
+        &'fut self,
+        ctx: &'fut mut ExecContext<'_, '_>,
+        args: &'fut [String],
         io: Io,
-    ) -> impl Future<Output = ExecResult> + use<'e, 'a, 'b> {
-        (self.func)(ctx, args, io)
+    ) -> impl Future<Output = ExecResult> + use<'fut> {
+        self.func.exec(ctx, args, io)
     }
 }

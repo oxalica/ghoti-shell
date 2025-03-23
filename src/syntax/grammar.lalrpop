@@ -1,0 +1,188 @@
+use crate::syntax::*;
+use crate::syntax::parse2::{Token, ParseError as E, ParseErrorKind as K};
+
+grammar<'i>;
+
+extern {
+    type Location = usize;
+    type Error = E;
+
+    enum Token<'i> {
+        NEWLINE => Token::Newline,
+        NOSP => Token::Join,
+        WORD => Token::Word(<&'i str>),
+        STRING_FRAGMENT => Token::Verbatim(<&'i str>),
+        "$VAR" => Token::Variable(<&'i str>),
+
+        "begin" => Token::Begin,
+        "end" => Token::End,
+        "if" => Token::If,
+        "else" => Token::Else,
+        "switch" => Token::Switch,
+        "case" => Token::Case,
+        "while" => Token::While,
+        "for" => Token::For,
+        "in" => Token::In,
+        "; and" => Token::SemiAnd,
+        "; or" => Token::SemiOr,
+        "not" => Token::Not,
+        "function" => Token::Function,
+
+        "$(" => Token::DollarLParen,
+        "(" => Token::LParen,
+        ")" => Token::RParen,
+        "[" => Token::LBracket,
+        "]" => Token::RBracket,
+        "{" => Token::LBrace,
+        "}" => Token::RBrace,
+        ">" => Token::Gt,
+        ">&" => Token::GtAmp,
+        ">?" => Token::GtQus,
+        "<" => Token::Lt,
+        "<&" => Token::LtAmp,
+        "<?" => Token::LtQus,
+        ">>" => Token::GtGt,
+        "?" => Token::Qus,
+        "&" => Token::Amp,
+        "|" => Token::Pipe,
+        "&|" => Token::AmpPipe,
+        ";" => Token::Semi,
+        "*" => Token::Star,
+        "**" => Token::StarStar,
+        "~" => Token::Tilde,
+        "\"" => Token::DQuote,
+        "'" => Token::SQuote,
+    }
+}
+
+pub SourceFile: SourceFile =
+    <StmtList> => SourceFile { stmts: <> };
+
+StmtList: Vec<Stmt> = {
+    => Vec::new(),
+    <Stmt> => vec![<>],
+    <mut ls:StmtList> EOS <s:Stmt?> => { ls.extend(s); ls },
+};
+
+EOS: () = { NEWLINE, ";" };
+
+Stmt: Stmt = {
+    #[precedence(level = "0")]
+    <Control> => <>,
+    #[precedence(level = "0")]
+    <Word+> => Stmt::Command(<>),
+
+    #[precedence(level = "1")]
+    <mut s:Stmt> <r:Redirect> => {
+        match &mut s {
+            Stmt::Redirect(_, rs) => { rs.push(r); s },
+            _ => Stmt::Redirect(s.into(), vec![r]),
+        }
+    },
+
+    #[precedence(level = "2")]
+    #[assoc(side = "right")]
+    <lhs:Stmt> <port:PipeOp> <rhs:Stmt> => Stmt::Pipe(port, lhs.into(), rhs.into()),
+
+    #[precedence(level = "3")]
+    "not" <Stmt> => Stmt::Not(<>.into()),
+
+    #[precedence(level = "4")]
+    #[assoc(side = "right")]
+    <lhs:Stmt> "; and" <rhs:Stmt> => Stmt::And(lhs.into(), rhs.into()),
+
+    #[precedence(level = "5")]
+    #[assoc(side = "right")]
+    <lhs:Stmt> "; or" <rhs:Stmt> => Stmt::Or(lhs.into(), rhs.into()),
+};
+
+PipeOp: RedirectPort = {
+    "|" => RedirectPort::STDOUT,
+    "&|" => RedirectPort::STDOUT_STDERR,
+}
+
+Redirect: Redirect = {
+    <port:("&" NOSP <@L> <Word> NOSP <@R>)?> <mode:RedirectMode> NOSP <dest:Word> =>? {
+        let port = match port {
+            None => mode.default_port(),
+            Some((lpos, port, rpos)) => {
+                match port {
+                    Word::Simple(port) => port.parse().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| E::new(lpos, rpos, K::InvalidRedirectPort))?
+            }
+        };
+        Ok(Redirect { port, mode, dest: RedirectDest::File(dest) })
+    },
+};
+RedirectMode: RedirectMode = {
+    "<"  => RedirectMode::Read,
+    "<?" => RedirectMode::ReadOrNull,
+    ">"  => RedirectMode::Write,
+    ">?" => RedirectMode::WriteNoClobber,
+    ">>" => RedirectMode::Append,
+    // TODO: "<&", ">&"
+};
+
+StmtBlock: Stmt =
+    <mut s:StmtList> => {
+        if s.len() == 1 {
+            s.pop().unwrap()
+        } else {
+            Stmt::Block(<>)
+        }
+    };
+
+Control: Stmt = {
+    "begin" EOS <StmtBlock> "end",
+    <If> => <>,
+    "while" <cond:Stmt> EOS <body:StmtBlock> "end" => Stmt::While(cond.into(), body.into()),
+    "for" <var:Word> "in" <seq:Word*> EOS <body:StmtBlock> "end" => Stmt::For(var, seq, body.into()),
+    // TODO: Switch
+    "function" <def:Word*> EOS <body:StmtBlock> "end" => Stmt::Function(def.into(), body.into()),
+};
+
+If: Stmt = {
+    "if" <cond:Stmt> EOS <then:StmtBlock> "end" =>
+        Stmt::If(cond.into(), then.into(), None),
+    "if" <cond:Stmt> EOS <then:StmtBlock> "else" <else_:If> "end" =>
+        Stmt::If(cond.into(), then.into(), Some(else_.into())),
+    "if" <cond:Stmt> EOS <then:StmtBlock> "else" EOS <else_:StmtBlock> "end" =>
+        Stmt::If(cond.into(), then.into(), Some(else_.into())),
+};
+
+Word: Word = {
+    <WordFrag> => Word::from(<>),
+    <String> => Word::Complex(<>),
+    <w:Word> NOSP <frag:WordFrag> => w.append(frag),
+    <w:Word> NOSP <frags:String> => {
+        let fs = match w {
+            Word::Simple(w) => std::iter::once(WordFrag::Literal(w)).chain(frags).collect(),
+            Word::Complex(mut fs) => { fs.extend(frags); fs },
+        };
+        Word::Complex(fs)
+    }
+};
+
+WordFrag: WordFrag = {
+    // TODO: "~"
+    <WORD> => WordFrag::Literal(<>.into()),
+    <"$VAR"> => WordFrag::Variable(<>.into()),
+    "*" => WordFrag::Wildcard,
+    "**" => WordFrag::WildcardRecursive,
+    "$(" <StmtBlock> ")" => WordFrag::Command(<>),
+    // "{"
+};
+
+String: Vec<WordFrag> = {
+    "\"" <DQuoteFrag*> "\"" => <>,
+    "'" <SQuoteFrag*> "'" => <>,
+};
+DQuoteFrag: WordFrag = {
+    <"$VAR"> => WordFrag::VariableNoSplit(<>.into()),
+    // $(
+    <STRING_FRAGMENT> => WordFrag::Literal(<>.into()),
+};
+SQuoteFrag: WordFrag =
+    <STRING_FRAGMENT> => WordFrag::Literal(<>.into());

@@ -3,6 +3,7 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 
 pub mod parse;
+pub mod parse2;
 
 pub const KEYWORDS: &[&str] = &[
     "begin", "end", "if", "else", "switch", "case", "for", "in", "and", "or", "not", "function",
@@ -106,6 +107,28 @@ pub type Words = Vec<Word>;
 pub enum Word {
     Simple(String),
     Complex(Vec<WordFrag>),
+}
+
+impl From<WordFrag> for Word {
+    fn from(frag: WordFrag) -> Self {
+        match frag {
+            WordFrag::Literal(s) => Word::Simple(s),
+            frag => Word::Complex(vec![frag]),
+        }
+    }
+}
+
+impl Word {
+    fn append(self, frag: WordFrag) -> Self {
+        let v = match self {
+            Word::Simple(lit) => vec![WordFrag::Literal(lit), frag],
+            Word::Complex(mut frags) => {
+                frags.push(frag);
+                frags
+            }
+        };
+        Self::Complex(v)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

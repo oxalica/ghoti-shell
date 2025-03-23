@@ -1,12 +1,13 @@
-use chumsky::Parser;
+use annotate_snippets::{Level, Renderer, Snippet};
 use ghoti_shell::exec::{Error, ExecContext, Executor, Io};
-use ghoti_shell::syntax::parse::source_file;
+use ghoti_shell::syntax::parse2::parse_source;
 use rustyline::error::ReadlineError;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = rustyline::DefaultEditor::new()?;
     let exec = Executor::default();
     let mut ctx = ExecContext::new(&exec);
+    let renderer = Renderer::styled();
 
     let mut last_status = 0;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -27,12 +28,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => return Err(err.into()),
         };
 
-        let src = match source_file().parse(&input).into_result() {
+        let src = match parse_source(&input) {
             Ok(src) => src,
-            Err(errs) => {
-                for err in errs {
-                    println!("no parse: {err}");
-                }
+            Err(err) => {
+                let msg = err.kind.to_string();
+                let msg = Level::Error
+                    .title(&msg)
+                    .snippet(Snippet::source(&input).annotation(Level::Error.span(err.span())));
+                println!("{}", renderer.render(msg));
+
                 last_status = 127;
                 continue;
             }

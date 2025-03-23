@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use logos::{Lexer, Logos, Span};
 use thiserror::Error;
 
@@ -13,6 +15,12 @@ pub struct ParseError {
     pub start_pos: usize,
     pub end_pos: usize,
     pub kind: ParseErrorKind,
+}
+
+impl ParseError {
+    pub fn span(&self) -> Range<usize> {
+        self.start_pos..self.end_pos
+    }
 }
 
 #[derive(Debug, PartialEq, Error)]

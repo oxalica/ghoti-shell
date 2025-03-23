@@ -46,6 +46,7 @@ extern {
         "&" => Token::Amp,
         "|" => Token::Pipe,
         "&|" => Token::AmpPipe,
+        ">|" => Token::GtPipe,
         ";" => Token::Semi,
         "*" => Token::Star,
         "**" => Token::StarStar,
@@ -99,6 +100,13 @@ Stmt: Stmt = {
 PipeOp: RedirectPort = {
     "|" => RedirectPort::STDOUT,
     "&|" => RedirectPort::STDOUT_STDERR,
+    "&" NOSP <lpos:@L> <port:Word> <rpos:@R> ">|" =>? {
+        match port {
+            Word::Simple(port) => port.parse().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| E::new(lpos, rpos, K::InvalidRedirectPort).into())
+    }
 }
 
 Redirect: Redirect = {

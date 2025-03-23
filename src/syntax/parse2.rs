@@ -141,6 +141,8 @@ enum Token<'i> {
     Pipe,
     #[token("&|")]
     AmpPipe,
+    #[token(">|")]
+    GtPipe,
     #[token(";")]
     Semi,
     #[token("*")]

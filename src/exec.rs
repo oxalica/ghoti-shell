@@ -110,9 +110,7 @@ pub struct Executor {
 impl Default for Executor {
     fn default() -> Self {
         Self {
-            // TODO: Avoid string allocations.
-            builtin_funcs: builtins::ALL_BUILTINS
-                .into_iter()
+            builtin_funcs: builtins::all_builtins()
                 .map(|(name, cmd)| (name.to_owned(), cmd))
                 .collect(),
         }
@@ -515,26 +513,6 @@ pub trait DynCommand: 'static + dyn_clone::DynClone {
     ) -> BoxFuture<'fut, ExecResult>;
 }
 
-impl<F> DynCommand for F
-where
-    F: 'static
-        + Clone
-        + for<'e, 'a, 'b> Fn(
-            &'e mut ExecContext<'a, 'b>,
-            &'e [String],
-            Io,
-        ) -> BoxFuture<'e, ExecResult>,
-{
-    fn exec<'fut>(
-        &'fut self,
-        ctx: &'fut mut ExecContext<'_, '_>,
-        args: &'fut [String],
-        io: Io,
-    ) -> BoxFuture<'fut, ExecResult> {
-        self(ctx, args, io)
-    }
-}
-
 dyn_clone::clone_trait_object!(DynCommand);
 
 #[derive(Clone)]
@@ -553,21 +531,28 @@ impl Command {
         Self { func }
     }
 
-    const fn new_zst_fn<F>(_func: F) -> Self
+    pub fn new_native<F>(func: F) -> Self
     where
-        F: 'static
-            + Copy
-            + for<'e, 'a, 'b> Fn(
-                &'e mut ExecContext<'a, 'b>,
-                &'e [String],
-                Io,
-            ) -> BoxFuture<'e, ExecResult>,
+        F: 'static + Clone + AsyncFn(&mut ExecContext<'_, '_>, &[String], Io) -> ExecResult,
     {
-        const { assert!(size_of::<F>() == 0) };
-        // SAFETY: `Box<ZST>` can be constructed via a aligned non-null dangling pointer.
-        // Ref: <https://doc.rust-lang.org/stable/std/boxed/index.html#memory-layout>
-        let b = unsafe { std::mem::transmute::<*mut F, Box<F>>(std::ptr::dangling_mut()) };
-        Self::new(b)
+        #[derive(Clone)]
+        struct Native<F>(F);
+
+        impl<F> DynCommand for Native<F>
+        where
+            F: 'static + Clone + AsyncFn(&mut ExecContext<'_, '_>, &[String], Io) -> ExecResult,
+        {
+            fn exec<'fut>(
+                &'fut self,
+                ctx: &'fut mut ExecContext<'_, '_>,
+                args: &'fut [String],
+                io: Io,
+            ) -> BoxFuture<'fut, ExecResult> {
+                Box::pin(self.0(ctx, args, io))
+            }
+        }
+
+        Self::new(Box::new(Native(func)))
     }
 
     pub fn new_function(stmt: Stmt) -> Self {

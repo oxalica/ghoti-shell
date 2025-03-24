@@ -9,22 +9,25 @@ use crate::exec::{Stdio, StdioCollectSink, validate_variable_name};
 
 use super::{Command, Error, ExecContext, ExecResult, Io};
 
-macro_rules! def_all_builtins {
-    ($($f:path $(=> $($empty:ident)?)?),* $(,)?) => {
-        pub const ALL_BUILTINS: [(&str, Command); 0usize $(+ 1usize $($empty)?)*] = [
-            $(
-                (
-                    stringify!($f),
-                    Command::new_zst_fn(|ctx, args, io| Box::pin($f(ctx, args, io)) as _),
-                ),
-            )*
-        ];
-    };
-}
+pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> {
+    macro_rules! wrap_command {
+        ($($f:path),* $(,)?) => {
+            [
+                $(
+                    (
+                        stringify!($f),
+                        Command::new_native($f),
+                    ),
+                )*
+            ]
+        };
+    }
 
-def_all_builtins! {
-    set,
-    builtin,
+    wrap_command! {
+        set,
+        builtin,
+    }
+    .into_iter()
 }
 
 pub async fn set(ctx: &mut ExecContext<'_, '_>, args: &[String], _io: Io) -> ExecResult {

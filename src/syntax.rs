@@ -2,7 +2,6 @@ use std::fmt;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
-pub mod parse;
 pub mod parse2;
 
 pub const KEYWORDS: &[&str] = &[

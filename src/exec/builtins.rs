@@ -120,7 +120,7 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs, io: Io) -> Ex
             .get_builtin(&args.args[0])
             .ok_or_else(|| todo!())?
             .clone();
-        cmd.exec(ctx, &args.args[1..], io).await
+        cmd.exec(ctx, &args.args, io).await
     }
 }
 

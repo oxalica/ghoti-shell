@@ -687,10 +687,11 @@ impl Command {
                 args: &'fut [String],
                 io: Io,
             ) -> BoxFuture<'fut, ExecResult> {
-                if args.len() > 1 {
-                    todo!();
-                }
-                Box::pin(ctx.exec_stmt(&self.0, io))
+                Box::pin(async move {
+                    let mut subctx = ExecContext::new_inside(ctx);
+                    subctx.set_var("argv", VarScope::Function, args[1..].to_vec());
+                    subctx.exec_stmt(&self.0, io).await
+                })
             }
         }
 

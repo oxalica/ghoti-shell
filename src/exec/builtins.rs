@@ -1,7 +1,10 @@
+use std::fmt::Write;
 use std::future::ready;
+use std::ops::ControlFlow;
 use std::process;
 use std::rc::Rc;
 
+use argh::FromArgs;
 use either::Either;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
@@ -10,61 +13,131 @@ use crate::exec::{Stdio, StdioCollectSink, validate_variable_name};
 use super::{Command, Error, ExecContext, ExecResult, Io, VarScope};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> {
-    macro_rules! wrap_command {
-        ($($f:path),* $(,)?) => {
-            [
-                $(
-                    (
-                        stringify!($f),
-                        Command::new_native($f),
-                    ),
-                )*
-            ]
-        };
-    }
-
-    wrap_command! {
-        set,
-        builtin,
-    }
+    [
+        ("command", Command::new_native_parsed(command)),
+        ("set", Command::new_native_parsed(set)),
+        ("builtin", Command::new_native_parsed(builtin)),
+    ]
     .into_iter()
 }
 
-pub async fn set(ctx: &mut ExecContext<'_>, args: &[String], _io: Io) -> ExecResult {
-    match args {
-        [name, vals @ ..] => {
+macro_rules! ensure {
+    ($cond:expr, $($msg:tt)+) => {
+        if !$cond {
+            return Err(Error::Custom(format!($($msg)+)));
+        }
+    };
+}
+
+// TODO
+#[derive(Debug, FromArgs)]
+pub struct SetArgs {
+    #[argh(switch, short = 'l')]
+    local: bool,
+    #[argh(switch, short = 'f')]
+    function: bool,
+    #[argh(switch, short = 'g')]
+    global: bool,
+    #[argh(switch, short = 'u')]
+    universal: bool,
+
+    #[argh(positional, greedy)]
+    args: Vec<String>,
+}
+
+pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs, io: Io) -> ExecResult {
+    let scope_flag_cnt = [args.local, args.function, args.global, args.universal]
+        .iter()
+        .map(|&b| b as u8)
+        .sum::<u8>();
+    ensure!(scope_flag_cnt <= 1, "scope flags are mutually exclusive");
+    let scope = if args.local {
+        VarScope::Local
+    } else if args.global {
+        VarScope::Global
+    } else if args.universal {
+        VarScope::Universal
+    } else {
+        VarScope::Function
+    };
+
+    match args.args.split_first() {
+        None => {
+            let mut buf = String::new();
+            ctx.list_vars::<()>(scope, |name, vals| {
+                buf.push_str(name);
+                if !vals.is_empty() {
+                    buf.push_str(" ");
+                    for (idx, val) in vals.iter().enumerate() {
+                        if idx != 0 {
+                            buf.push_str("  ");
+                        }
+                        write!(buf, "\"{}\"", val.escape_debug()).unwrap();
+                    }
+                }
+                ControlFlow::Continue(())
+            });
+            io.write_stdout(buf)
+        }
+        Some((name, vals)) => {
             validate_variable_name(name)?;
-            ctx.set_var(name, VarScope::default(), vals);
+            ctx.set_var(name, scope, vals);
             Ok(())
         }
-        _ => todo!(),
     }
 }
 
-pub async fn builtin(ctx: &mut ExecContext<'_>, args: &[String], io: Io) -> ExecResult {
-    match args {
-        [cmd, args @ ..] if !cmd.starts_with("-") => {
-            let cmd = ctx.get_builtin(cmd).ok_or_else(|| todo!())?.clone();
-            cmd.exec(ctx, args, io).await
+#[derive(Debug, FromArgs)]
+pub struct BuiltinArgs {
+    #[argh(switch, short = 'n')]
+    names: bool,
+    #[argh(switch, short = 'q')]
+    query: bool,
+
+    #[argh(positional, greedy)]
+    args: Vec<String>,
+}
+
+pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs, io: Io) -> ExecResult {
+    ensure!(
+        !(args.names && args.query),
+        "--names and --query are mutually exclusive"
+    );
+    if args.names {
+        let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
+        names.sort_unstable();
+        let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
+        io.write_stdout(out)
+    } else if args.query {
+        if args.args.iter().any(|name| ctx.get_builtin(name).is_some()) {
+            Ok(())
+        } else {
+            Err(Error::ExitCode(1))
         }
-        [o] if o == "--names" => {
-            let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
-            names.sort_unstable();
-            let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
-            io.write_stdout(out)
-        }
-        [o, names @ ..] if o == "--query" => {
-            if names.iter().any(|name| ctx.get_builtin(name).is_some()) {
-                Ok(())
-            } else {
-                Err(Error::ExitCode(1))
-            }
-        }
-        _ => todo!(),
+    } else {
+        ensure!(!args.args.is_empty(), "missing builtin name");
+        let cmd = ctx
+            .get_builtin(&args.args[0])
+            .ok_or_else(|| todo!())?
+            .clone();
+        cmd.exec(ctx, &args.args[1..], io).await
     }
 }
 
-pub async fn command(_ctx: &mut ExecContext<'_>, args: &[String], io: Io) -> ExecResult {
+#[derive(Debug, FromArgs)]
+pub struct CommandArgs {
+    #[argh(switch, short = 'a')]
+    pub all: bool,
+    #[argh(switch, short = 'q')]
+    pub query: bool,
+    #[argh(switch, short = 's')]
+    pub search: bool,
+
+    #[argh(positional, greedy)]
+    pub args: Vec<String>,
+}
+
+pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> ExecResult {
     async fn copy_stdio_to_sink(rdr: impl AsyncRead + Unpin, sink: StdioCollectSink) -> ExecResult {
         let mut stdout = tokio::io::BufReader::new(rdr);
         loop {
@@ -78,7 +151,9 @@ pub async fn command(_ctx: &mut ExecContext<'_>, args: &[String], io: Io) -> Exe
         }
     }
 
-    let (cmd, args) = args.split_first().ok_or(Error::EmptyCommand)?;
+    ensure!(!args.all && !args.query && !args.search, "TODO");
+
+    let (cmd, args) = args.args.split_first().ok_or(Error::EmptyCommand)?;
 
     let cvt_stdio = |s: Stdio, is_stdin: bool| {
         Ok(match s {

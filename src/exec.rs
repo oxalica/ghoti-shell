@@ -2,7 +2,8 @@ use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::ops::Deref;
+use std::marker::PhantomData;
+use std::ops::{ControlFlow, Deref};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -195,6 +196,16 @@ impl Executor {
         self.funcs.borrow_mut().remove(name);
     }
 
+    pub fn list_global_vars<B>(
+        &self,
+        mut f: impl FnMut(&str, &ValueList) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        for (name, vals) in self.vars.borrow().iter() {
+            f(name, vals)?;
+        }
+        ControlFlow::Continue(())
+    }
+
     pub fn get_global_var(&self, name: &str) -> Option<impl Deref<Target = ValueList>> {
         Ref::filter_map(self.vars.borrow(), |m| m.get(name)).ok()
     }
@@ -247,6 +258,24 @@ impl<'a> ExecContext<'a> {
     pub fn get_func(&self, name: &str) -> Option<Command> {
         self.get_global_func(name)
             .or_else(|| self.get_builtin(name))
+    }
+
+    pub fn list_vars<B>(
+        &self,
+        scope: VarScope,
+        mut f: impl FnMut(&str, &ValueList) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        match scope {
+            VarScope::Local => todo!(),
+            VarScope::Function => {
+                for (name, vals) in &self.func_vars {
+                    f(name, vals)?;
+                }
+                ControlFlow::Continue(())
+            }
+            VarScope::Global => self.list_global_vars(f),
+            VarScope::Universal => todo!(),
+        }
     }
 
     pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = ValueList>> {
@@ -430,15 +459,19 @@ impl<'a> ExecContext<'a> {
     }
 
     pub async fn exec_command(&mut self, words: &[String], io: Io) -> ExecResult {
-        let (cmd, args) = words.split_first().ok_or(Error::EmptyCommand)?;
+        let cmd = words.first().ok_or(Error::EmptyCommand)?;
 
-        dbg!(cmd);
-        dbg!(&self);
         if let Some(cmd) = self.get_func(cmd) {
-            return cmd.exec(self, args, io).await;
+            return cmd.exec(self, words, io).await;
         }
 
-        builtins::command(self, words, io).await
+        let args = builtins::CommandArgs {
+            all: false,
+            query: false,
+            search: false,
+            args: words.to_vec(),
+        };
+        builtins::command(self, args, io).await
     }
 
     // TODO: Word and size limit.
@@ -608,6 +641,41 @@ impl Command {
         Self::new(Box::new(Native(func)))
     }
 
+    pub fn new_native_parsed<F, Args>(func: F) -> Self
+    where
+        F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args, Io) -> ExecResult,
+        Args: 'static + argh::FromArgs,
+    {
+        struct Native<F, Args>(F, PhantomData<fn(Args)>);
+
+        impl<F: Clone, Args> Clone for Native<F, Args> {
+            fn clone(&self) -> Self {
+                Self(self.0.clone(), PhantomData)
+            }
+        }
+
+        impl<F, Args> DynCommand for Native<F, Args>
+        where
+            F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args, Io) -> ExecResult,
+            Args: 'static + argh::FromArgs,
+        {
+            fn exec<'fut>(
+                &'fut self,
+                ctx: &'fut mut ExecContext<'_>,
+                args: &'fut [String],
+                io: Io,
+            ) -> BoxFuture<'fut, ExecResult> {
+                let strs = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+                match <Args as argh::FromArgs>::from_args(&[strs[0]], &strs[1..]) {
+                    Ok(parsed) => Box::pin((self.0)(ctx, parsed, io)),
+                    Err(_) => todo!(),
+                }
+            }
+        }
+
+        Self::new(Box::new(Native(func, PhantomData)))
+    }
+
     pub fn new_function(stmt: Stmt) -> Self {
         #[derive(Clone)]
         struct Func(Rc<Stmt>);
@@ -619,7 +687,7 @@ impl Command {
                 args: &'fut [String],
                 io: Io,
             ) -> BoxFuture<'fut, ExecResult> {
-                if !args.is_empty() {
+                if args.len() > 1 {
                     todo!();
                 }
                 Box::pin(ctx.exec_stmt(&self.0, io))

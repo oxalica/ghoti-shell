@@ -1,25 +1,28 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::{fmt, slice};
 
-use crate::syntax::{RedirectDest, RedirectMode, RedirectPort, Stmt, Word, WordFrag};
+use crate::syntax::{self, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag};
 
 pub mod builtins;
 mod utils;
 
+use either::Either;
 pub use utils::*;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type ExecResult<T = ()> = Result<T>;
 
-pub type Bytes = Vec<u8>;
+pub type Value = String;
+pub type ValueList = Vec<String>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -102,18 +105,60 @@ impl Io {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct VarOpt: u8 {
+        const LOCAL     = 0b00;
+        const FUNCTION  = 0b01;
+        const GLOBAL    = 0b10;
+        const UNIVERSAL = 0b11;
+
+        const SCOPES    = 0b11;
+
+        const EXPORT = 0b100;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VarScope {
+    Local,
+    #[default]
+    Function,
+    Global,
+    Universal,
+}
+
+impl From<VarScope> for VarOpt {
+    fn from(scope: VarScope) -> Self {
+        VarOpt::from_bits(scope as u8).expect("always valid")
+    }
+}
+
+impl VarOpt {
+    pub fn scope(self) -> VarScope {
+        match self & Self::SCOPES {
+            Self::LOCAL => VarScope::Local,
+            Self::FUNCTION => VarScope::Function,
+            Self::GLOBAL => VarScope::Global,
+            Self::UNIVERSAL => VarScope::Universal,
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Executor {
     builtin_funcs: HashMap<String, Command>,
+    funcs: RefCell<HashMap<String, Command>>,
+    vars: RefCell<HashMap<String, ValueList>>,
 }
 
 impl Default for Executor {
     fn default() -> Self {
-        Self {
-            builtin_funcs: builtins::all_builtins()
-                .map(|(name, cmd)| (name.to_owned(), cmd))
-                .collect(),
-        }
+        let mut this = Self::new();
+        this.builtin_funcs
+            .extend(builtins::all_builtins().map(|(name, cmd)| (name.to_owned(), cmd)));
+        this
     }
 }
 
@@ -121,127 +166,135 @@ impl Executor {
     pub fn new() -> Self {
         Self {
             builtin_funcs: HashMap::new(),
+            funcs: RefCell::new(HashMap::new()),
+            vars: RefCell::new(HashMap::new()),
         }
     }
 
-    pub fn add_builtin_func(&mut self, name: String, cmd: Command) {
+    pub fn builtins(&self) -> impl ExactSizeIterator<Item = (&str, &Command)> {
+        self.builtin_funcs.iter().map(|(name, cmd)| (&**name, cmd))
+    }
+
+    pub fn set_builtin(&mut self, name: String, cmd: Command) {
         self.builtin_funcs.insert(name, cmd);
+    }
+
+    pub fn get_builtin(&self, name: &str) -> Option<Command> {
+        self.builtin_funcs.get(name).cloned()
+    }
+
+    pub fn get_global_func(&self, name: &str) -> Option<Command> {
+        self.funcs.borrow().get(name).cloned()
+    }
+
+    pub fn set_global_func(&self, name: String, cmd: Command) {
+        self.funcs.borrow_mut().insert(name, cmd);
+    }
+
+    pub fn remove_global_func(&self, name: &str) {
+        self.funcs.borrow_mut().remove(name);
+    }
+
+    pub fn get_global_var(&self, name: &str) -> Option<impl Deref<Target = ValueList>> {
+        Ref::filter_map(self.vars.borrow(), |m| m.get(name)).ok()
+    }
+
+    pub fn set_global_var(&self, name: String, vals: ValueList) {
+        self.vars.borrow_mut().insert(name, vals);
+    }
+
+    pub fn remove_global_var(&self, name: &str) {
+        self.vars.borrow_mut().remove(name);
     }
 }
 
 #[derive(Debug)]
-pub struct ExecContext<'a, 'b> {
-    funcs: HashMap<String, Option<Command>>,
-    vars: HashMap<String, Option<Vec<String>>>,
-    root: &'b Executor,
-    outer: Option<&'a ExecContext<'a, 'b>>,
+pub struct ExecContext<'a> {
+    func_vars: HashMap<String, ValueList>,
+    root: &'a Executor,
+    outer: Option<&'a ExecContext<'a>>,
 }
 
-impl<'b> ExecContext<'_, 'b> {
-    pub fn new(root: &'b Executor) -> Self {
+impl Deref for ExecContext<'_> {
+    type Target = Executor;
+
+    fn deref(&self) -> &Self::Target {
+        self.root
+    }
+}
+
+impl<'a> ExecContext<'a> {
+    pub fn new(root: &'a Executor) -> Self {
         Self {
-            funcs: HashMap::new(),
-            vars: HashMap::new(),
+            func_vars: HashMap::new(),
             root,
             outer: None,
         }
     }
 
-    pub fn fork(&self) -> ExecContext<'_, 'b> {
-        ExecContext {
-            funcs: HashMap::new(),
-            vars: HashMap::new(),
-            root: self.root,
-            outer: Some(self),
+    pub fn new_inside(outer: &'a ExecContext<'a>) -> Self {
+        Self {
+            func_vars: HashMap::new(),
+            root: outer.root,
+            outer: Some(outer),
         }
     }
 
-    pub fn cut<'c>(self) -> ExecContext<'c, 'b> {
-        ExecContext {
-            funcs: self.funcs,
-            vars: self.vars,
-            root: self.root,
-            outer: None,
+    pub fn backtrace(&self) -> impl Iterator<Item = &Self> {
+        std::iter::successors(Some(self), |ctx| ctx.outer)
+    }
+
+    pub fn get_func(&self, name: &str) -> Option<Command> {
+        self.get_global_func(name)
+            .or_else(|| self.get_builtin(name))
+    }
+
+    pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = ValueList>> {
+        match self.func_vars.get(name) {
+            Some(vals) => Some(Either::Left(vals)),
+            None => self.get_global_var(name).map(Either::Right),
         }
     }
 
-    async fn fork_exec(&self, stmt: &Stmt, io: Io) -> (ExecContext<'_, 'b>, ExecResult) {
-        let mut subctx = self.fork();
-        let ret = subctx.exec_stmt(stmt, io).await;
-        (subctx, ret)
-    }
-
-    pub fn merge(&mut self, rhs: ExecContext<'_, '_>) {
-        for (name, cmd) in rhs.funcs {
-            match cmd {
-                Some(cmd) => self.set_func(name, cmd),
-                None => self.remove_func(&name),
+    pub fn set_var(
+        &mut self,
+        name: impl Into<String>,
+        opt: impl Into<VarOpt>,
+        vals: impl Into<ValueList>,
+    ) {
+        let (name, opt, vals) = (name.into(), opt.into(), vals.into());
+        if opt.contains(VarOpt::EXPORT) {
+            todo!();
+        }
+        match opt.scope() {
+            VarScope::Local => todo!(),
+            VarScope::Function => {
+                self.func_vars.insert(name, vals);
             }
-        }
-        for (name, vals) in rhs.vars {
-            match vals {
-                Some(vals) => self.set_var(name, vals),
-                None => self.remove_var(&name),
+            VarScope::Global => {
+                self.set_global_var(name, vals);
             }
+            VarScope::Universal => todo!(),
         }
     }
 
-    pub fn builtin_funcs(&self) -> impl ExactSizeIterator<Item = (&str, &Command)> {
-        self.root
-            .builtin_funcs
-            .iter()
-            .map(|(name, cmd)| (&**name, cmd))
-    }
-
-    pub fn get_builtin_func(&self, name: &str) -> Option<&Command> {
-        self.root.builtin_funcs.get(name)
-    }
-
-    pub fn get_func(&self, name: &str) -> Option<&Command> {
-        match (self.funcs.get(name), self.outer) {
-            // Defined locally.
-            (Some(Some(cmd)), _) => Some(cmd),
-            // Inherited.
-            (None, Some(outer)) => outer.get_func(name),
-            // Unset locally, or not set at all.
-            (Some(None), _) | (None, None) => self.get_builtin_func(name),
-        }
-    }
-
-    pub fn set_func(&mut self, name: impl Into<String>, cmd: Command) {
-        self.funcs.insert(name.into(), Some(cmd));
-    }
-
-    pub fn remove_func(&mut self, name: &str) {
-        if self.outer.is_none() {
-            self.funcs.remove(name);
-        } else {
-            self.funcs.insert(name.to_owned(), None);
-        }
-    }
-
-    pub fn get_var(&self, name: &str) -> Option<&[String]> {
-        match (self.vars.get(name), self.outer) {
-            // Defined locally.
-            (Some(Some(vals)), _) => Some(vals),
-            // Inherited.
-            (None, Some(outer)) => outer.get_var(name),
-            // Unset locally, or not set at all.
-            // TODO: Builtin variables.
-            (Some(None), _) | (None, None) => None,
-        }
-    }
-
-    pub fn set_var(&mut self, name: impl Into<String>, values: impl IntoIterator<Item = String>) {
-        self.vars
-            .insert(name.into(), Some(values.into_iter().collect()));
-    }
-
-    pub fn remove_var(&mut self, name: &str) {
-        if self.outer.is_none() {
-            self.vars.remove(name);
-        } else {
-            self.vars.insert(name.to_owned(), None);
+    pub fn remove_var(&mut self, scope: impl Into<Option<VarScope>>, name: &str) {
+        match scope.into() {
+            Some(VarScope::Local) => {
+                todo!()
+            }
+            Some(VarScope::Function) => {
+                self.func_vars.remove(name);
+            }
+            Some(VarScope::Global) => {
+                self.remove_global_var(name);
+            }
+            Some(VarScope::Universal) => todo!(),
+            None => {
+                if self.func_vars.remove(name).is_none() {
+                    self.remove_global_var(name);
+                }
+            }
         }
     }
 
@@ -263,7 +316,7 @@ impl<'b> ExecContext<'_, 'b> {
         match stmt {
             Stmt::Command(words) => {
                 let words = self.expand_words(words).await?;
-                self.exec_cmd(&words, io).await
+                self.exec_command(&words, io).await
             }
             Stmt::Block(stmts) => Box::pin(self.exec_stmts(stmts, io)).await,
             Stmt::If(cond, then, else_) => {
@@ -285,7 +338,7 @@ impl<'b> ExecContext<'_, 'b> {
                 let var = validate_variable_words(&var)?;
                 let elems = self.expand_words(elem_ws).await?;
                 for elem in elems {
-                    self.set_var(var, [elem]);
+                    self.set_var(var, VarScope::default(), [elem]);
                     self.exec_stmt_boxed(body, io.clone()).await?;
                 }
                 Ok(())
@@ -297,7 +350,7 @@ impl<'b> ExecContext<'_, 'b> {
                 };
                 validate_function_name(name)?;
                 let func_cmd = Command::new_function((**stmt).clone());
-                self.set_func(name, func_cmd);
+                self.set_global_func(name.into(), func_cmd);
                 Ok(())
             }
             Stmt::Redirect(stmt, redirects) => {
@@ -352,13 +405,13 @@ impl<'b> ExecContext<'_, 'b> {
                     ..io.clone()
                 };
 
-                let ((ctx1, _ret1), (ctx2, ret2)) = tokio::join!(
-                    Box::pin(self.fork_exec(lhs, lhs_io)),
-                    Box::pin(self.fork_exec(rhs, rhs_io)),
+                let mut lhs_ctx = ExecContext::new_inside(self);
+                let mut rhs_ctx = ExecContext::new_inside(self);
+                let (_ret1, ret2) = tokio::join!(
+                    Box::pin(async move { lhs_ctx.exec_stmt(lhs, lhs_io).await }),
+                    Box::pin(async move { rhs_ctx.exec_stmt(rhs, rhs_io).await }),
                 );
-                let (ctx1, ctx2) = (ctx1.cut(), ctx2.cut());
-                self.merge(ctx1);
-                self.merge(ctx2);
+                // TODO: pipestatus
                 ret2
             }
             Stmt::Not(stmt) => match self.exec_stmt_boxed(stmt, io).await {
@@ -376,12 +429,12 @@ impl<'b> ExecContext<'_, 'b> {
         }
     }
 
-    pub async fn exec_cmd(&mut self, words: &[String], io: Io) -> ExecResult {
+    pub async fn exec_command(&mut self, words: &[String], io: Io) -> ExecResult {
         let (cmd, args) = words.split_first().ok_or(Error::EmptyCommand)?;
 
-        // NB. The command borrows `self` but may modify the `self` during execution.
-        // We need to clone it first.
-        if let Some(cmd) = self.get_func(cmd).cloned() {
+        dbg!(cmd);
+        dbg!(&self);
+        if let Some(cmd) = self.get_func(cmd) {
             return cmd.exec(self, args, io).await;
         }
 
@@ -389,7 +442,7 @@ impl<'b> ExecContext<'_, 'b> {
     }
 
     // TODO: Word and size limit.
-    async fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>> {
+    async fn expand_words(&mut self, words: &[syntax::Word]) -> Result<Vec<String>> {
         fn dfs(
             ret: &mut Vec<String>,
             stack: &mut String,
@@ -429,11 +482,11 @@ impl<'b> ExecContext<'_, 'b> {
 
         for w in words {
             let frags = match w {
-                Word::Simple(w) => {
+                syntax::Word::Simple(w) => {
                     ret.push(w.clone());
                     continue;
                 }
-                Word::Complex(frags) => frags,
+                syntax::Word::Complex(frags) => frags,
             };
 
             let mut expanded = Vec::with_capacity(frags.len());
@@ -507,7 +560,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub trait DynCommand: 'static + dyn_clone::DynClone {
     fn exec<'fut>(
         &'fut self,
-        ctx: &'fut mut ExecContext<'_, '_>,
+        ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
         io: Io,
     ) -> BoxFuture<'fut, ExecResult>;
@@ -533,18 +586,18 @@ impl Command {
 
     pub fn new_native<F>(func: F) -> Self
     where
-        F: 'static + Clone + AsyncFn(&mut ExecContext<'_, '_>, &[String], Io) -> ExecResult,
+        F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String], Io) -> ExecResult,
     {
         #[derive(Clone)]
         struct Native<F>(F);
 
         impl<F> DynCommand for Native<F>
         where
-            F: 'static + Clone + AsyncFn(&mut ExecContext<'_, '_>, &[String], Io) -> ExecResult,
+            F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String], Io) -> ExecResult,
         {
             fn exec<'fut>(
                 &'fut self,
-                ctx: &'fut mut ExecContext<'_, '_>,
+                ctx: &'fut mut ExecContext<'_>,
                 args: &'fut [String],
                 io: Io,
             ) -> BoxFuture<'fut, ExecResult> {
@@ -562,7 +615,7 @@ impl Command {
         impl DynCommand for Func {
             fn exec<'fut>(
                 &'fut self,
-                ctx: &'fut mut ExecContext<'_, '_>,
+                ctx: &'fut mut ExecContext<'_>,
                 args: &'fut [String],
                 io: Io,
             ) -> BoxFuture<'fut, ExecResult> {
@@ -578,7 +631,7 @@ impl Command {
 
     pub fn exec<'fut>(
         &'fut self,
-        ctx: &'fut mut ExecContext<'_, '_>,
+        ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
         io: Io,
     ) -> impl Future<Output = ExecResult> + use<'fut> {

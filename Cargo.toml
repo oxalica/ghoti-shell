@@ -6,6 +6,7 @@ license = "GPL-2.0-only"
 
 [dependencies]
 annotate-snippets = "0.11.5"
+bitflags = "2.9.0"
 dyn-clone = "1.0.19"
 either = "1.15.0"
 lalrpop-util = { version = "0.22", default-features = false }

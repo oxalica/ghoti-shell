@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::exec::{Stdio, StdioCollectSink, validate_variable_name};
 
-use super::{Command, Error, ExecContext, ExecResult, Io};
+use super::{Command, Error, ExecContext, ExecResult, Io, VarScope};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> {
     macro_rules! wrap_command {
@@ -30,37 +30,31 @@ pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> 
     .into_iter()
 }
 
-pub async fn set(ctx: &mut ExecContext<'_, '_>, args: &[String], _io: Io) -> ExecResult {
+pub async fn set(ctx: &mut ExecContext<'_>, args: &[String], _io: Io) -> ExecResult {
     match args {
         [name, vals @ ..] => {
             validate_variable_name(name)?;
-            ctx.set_var(name, vals.iter().cloned());
+            ctx.set_var(name, VarScope::default(), vals);
             Ok(())
         }
         _ => todo!(),
     }
 }
 
-pub async fn builtin(ctx: &mut ExecContext<'_, '_>, args: &[String], io: Io) -> ExecResult {
+pub async fn builtin(ctx: &mut ExecContext<'_>, args: &[String], io: Io) -> ExecResult {
     match args {
         [cmd, args @ ..] if !cmd.starts_with("-") => {
-            let cmd = ctx.get_builtin_func(cmd).ok_or_else(|| todo!())?.clone();
+            let cmd = ctx.get_builtin(cmd).ok_or_else(|| todo!())?.clone();
             cmd.exec(ctx, args, io).await
         }
         [o] if o == "--names" => {
-            let mut names = ctx
-                .builtin_funcs()
-                .map(|(name, _)| name)
-                .collect::<Vec<_>>();
+            let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
             names.sort_unstable();
             let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
             io.write_stdout(out)
         }
         [o, names @ ..] if o == "--query" => {
-            if names
-                .iter()
-                .any(|name| ctx.get_builtin_func(name).is_some())
-            {
+            if names.iter().any(|name| ctx.get_builtin(name).is_some()) {
                 Ok(())
             } else {
                 Err(Error::ExitCode(1))
@@ -70,7 +64,7 @@ pub async fn builtin(ctx: &mut ExecContext<'_, '_>, args: &[String], io: Io) -> 
     }
 }
 
-pub async fn command(_ctx: &mut ExecContext<'_, '_>, args: &[String], io: Io) -> ExecResult {
+pub async fn command(_ctx: &mut ExecContext<'_>, args: &[String], io: Io) -> ExecResult {
     async fn copy_stdio_to_sink(rdr: impl AsyncRead + Unpin, sink: StdioCollectSink) -> ExecResult {
         let mut stdout = tokio::io::BufReader::new(rdr);
         loop {

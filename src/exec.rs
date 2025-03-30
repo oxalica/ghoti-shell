@@ -1,5 +1,5 @@
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::marker::PhantomData;
@@ -149,9 +149,9 @@ impl VarOpt {
 
 #[derive(Debug)]
 pub struct Executor {
-    builtin_funcs: HashMap<String, Command>,
-    funcs: RefCell<HashMap<String, Command>>,
-    vars: RefCell<HashMap<String, ValueList>>,
+    builtin_funcs: BTreeMap<String, Command>,
+    funcs: RefCell<BTreeMap<String, Command>>,
+    vars: RefCell<BTreeMap<String, ValueList>>,
 }
 
 impl Default for Executor {
@@ -166,9 +166,9 @@ impl Default for Executor {
 impl Executor {
     pub fn new() -> Self {
         Self {
-            builtin_funcs: HashMap::new(),
-            funcs: RefCell::new(HashMap::new()),
-            vars: RefCell::new(HashMap::new()),
+            builtin_funcs: BTreeMap::new(),
+            funcs: RefCell::new(BTreeMap::new()),
+            vars: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -182,6 +182,10 @@ impl Executor {
 
     pub fn get_builtin(&self, name: &str) -> Option<Command> {
         self.builtin_funcs.get(name).cloned()
+    }
+
+    pub(crate) fn global_funcs(&self) -> Ref<'_, BTreeMap<String, Command>> {
+        self.funcs.borrow()
     }
 
     pub fn get_global_func(&self, name: &str) -> Option<Command> {
@@ -221,7 +225,7 @@ impl Executor {
 
 #[derive(Debug)]
 pub struct ExecContext<'a> {
-    func_vars: HashMap<String, ValueList>,
+    func_vars: BTreeMap<String, ValueList>,
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
 }
@@ -237,7 +241,7 @@ impl Deref for ExecContext<'_> {
 impl<'a> ExecContext<'a> {
     pub fn new(root: &'a Executor) -> Self {
         Self {
-            func_vars: HashMap::new(),
+            func_vars: BTreeMap::new(),
             root,
             outer: None,
         }
@@ -245,7 +249,7 @@ impl<'a> ExecContext<'a> {
 
     pub fn new_inside(outer: &'a ExecContext<'a>) -> Self {
         Self {
-            func_vars: HashMap::new(),
+            func_vars: BTreeMap::new(),
             root: outer.root,
             outer: Some(outer),
         }
@@ -253,6 +257,24 @@ impl<'a> ExecContext<'a> {
 
     pub fn backtrace(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |ctx| ctx.outer)
+    }
+
+    pub fn list_funcs<B>(
+        &self,
+        mut f: impl FnMut(&str, &Command) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        for (name, cmd) in itertools::merge_join_by(
+            self.global_funcs()
+                .iter()
+                .map(|(name, cmd)| (&name[..], cmd)),
+            self.builtins(),
+            |lhs, rhs| lhs.0.cmp(rhs.0),
+        )
+        .map(|kv| kv.into_left())
+        {
+            f(name, cmd)?;
+        }
+        ControlFlow::Continue(())
     }
 
     pub fn get_func(&self, name: &str) -> Option<Command> {

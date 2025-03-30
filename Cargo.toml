@@ -10,10 +10,12 @@ argh = { version = "0.1.13", default-features = false }
 bitflags = "2.9.0"
 dyn-clone = "1.0.19"
 either = "1.15.0"
+itertools = "0.14.0"
 lalrpop-util = { version = "0.22", default-features = false }
 logos = "0.15"
 os_pipe = "1.2.1"
-rustyline = "15.0.0"
+owo-colors = "4.2.0"
+rustyline = { version = "15.0.0", features = ["derive"] }
 thiserror = "2.0.12"
 tokio = { version = "1.44.1", features = ["io-util", "macros", "process", "rt"] }
 

@@ -10,9 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::command::{BoxCommand, Builtin};
 use crate::utils::validate_variable_name;
-use crate::{
-    Error, ExecContext, ExecResult, ExitStatus, Stdio, StdioCollectSink, VarScope, Variable,
-};
+use crate::{Error, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand)> {
     [
@@ -26,7 +24,7 @@ pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand
 macro_rules! ensure {
     ($cond:expr, $($msg:tt)+) => {
         if !$cond {
-            return Err(Error::Custom(format!($($msg)+)));
+            return Err(Error::Custom(format!($($msg)+)).into());
         }
     };
 }
@@ -57,7 +55,6 @@ pub struct SetArgs {
 }
 
 pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
-    dbg!(&args);
     let scope_flag_cnt = [args.local, args.function, args.global, args.universal]
         .iter()
         .map(|&b| b as u8)
@@ -96,7 +93,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 buf.push('\n');
                 ControlFlow::Continue(())
             });
-            ctx.io().write_stdout(buf)
+            ctx.io().write_stdout(buf).await
         }
         Some((name, vals)) => {
             validate_variable_name(name)?;
@@ -105,7 +102,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 export: args.export,
             };
             ctx.set_var(name, scope.unwrap_or(VarScope::Function), var);
-            Ok(ExitStatus::SUCCESS)
+            Ok(Status::SUCCESS)
         }
     }
 }
@@ -130,17 +127,17 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult
         let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
         names.sort_unstable();
         let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
-        ctx.io().write_stdout(out)
+        ctx.io().write_stdout(out).await
     } else if args.query {
         let ok = args.args.iter().any(|name| ctx.get_builtin(name).is_some());
         Ok(ok.into())
     } else {
         ensure!(!args.args.is_empty(), "missing builtin name");
+        let name = &args.args[0];
         let cmd = ctx
-            .get_builtin(&args.args[0])
-            .ok_or_else(|| todo!())?
-            .clone();
-        cmd.exec(ctx, &args.args).await
+            .get_builtin(name)
+            .ok_or_else(|| Error::CommandNotFound(name.into()))?;
+        Ok(cmd.exec(ctx, &args.args).await)
     }
 }
 
@@ -158,12 +155,15 @@ pub struct CommandArgs {
 }
 
 pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult {
-    async fn copy_stdio_to_sink(rdr: impl AsyncRead + Unpin, sink: StdioCollectSink) -> ExecResult {
+    async fn copy_stdio_to_sink(
+        rdr: impl AsyncRead + Unpin,
+        sink: StdioCollectSink,
+    ) -> ExecResult<()> {
         let mut stdout = tokio::io::BufReader::new(rdr);
         loop {
-            let buf = stdout.fill_buf().await.map_err(Error::Io)?;
+            let buf = stdout.fill_buf().await.map_err(Error::ReadWrite)?;
             if buf.is_empty() {
-                return Ok(ExitStatus::SUCCESS);
+                return Ok(());
             }
             sink(buf)?;
             let len = buf.len();
@@ -216,8 +216,8 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
             .map_err(|err| Error::SpawnProcess(cmd.into(), err))?
     };
 
-    let mut copy_stdout = Either::Left(ready(ExecResult::Ok(ExitStatus::SUCCESS)));
-    let mut copy_stderr = Either::Left(ready(ExecResult::Ok(ExitStatus::SUCCESS)));
+    let mut copy_stdout = Either::Left(ready(ExecResult::Ok(())));
+    let mut copy_stderr = Either::Left(ready(ExecResult::Ok(())));
     if let Some(sink) = stdout_sink {
         copy_stdout = Either::Right(copy_stdio_to_sink(child.stdout.take().unwrap(), sink));
     }
@@ -225,22 +225,23 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
         copy_stderr = Either::Right(copy_stdio_to_sink(child.stderr.take().unwrap(), sink));
     }
 
-    // FIXME: Check forwarding failure?
-    let (ret_wait, _ret_stdout, _ret_stderr) = tokio::join!(child.wait(), copy_stdout, copy_stderr);
+    let (ret_wait, ret_stdout, ret_stderr) = tokio::join!(child.wait(), copy_stdout, copy_stderr);
+    ret_stdout?;
+    ret_stderr?;
     let status = ret_wait.map_err(Error::WaitProcess)?;
     if status.success() {
-        return Ok(ExitStatus::SUCCESS);
+        return Ok(Status::SUCCESS);
     }
 
     if let Some(code) = status.code() {
-        return Ok(ExitStatus(code));
+        return Ok(Status(code));
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(sig) = status.signal() {
-            return Ok(ExitStatus(127 + sig));
+            return Ok(Status(127 + sig));
         }
     }
 

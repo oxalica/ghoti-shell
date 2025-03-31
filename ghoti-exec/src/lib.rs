@@ -1,7 +1,7 @@
 use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io;
 use std::ops::{ControlFlow, Deref};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -9,11 +9,15 @@ use std::rc::Rc;
 use std::{fmt, slice};
 
 use builtins::FunctionOpts;
-use command::{BoxCommand, Command, UserFunc};
+use command::{BoxCommand, Command, ReportResult, UserFunc};
 use either::Either;
-use ghoti_syntax::{self as ast, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag};
+use ghoti_syntax::{
+    self as ast, RedirectDest, RedirectMode, RedirectPort, SourceFile, Stmt, WordFrag,
+};
+use tokio::io::AsyncWriteExt;
+use utils::validate_variable_name;
 
-use crate::utils::{validate_function_name, validate_variable_words};
+use crate::utils::validate_function_name;
 
 pub mod builtins;
 pub mod command;
@@ -21,35 +25,35 @@ mod utils;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub type ExecResult<T = ExitStatus> = Result<T>;
+pub type ExecResult<T = Status> = Result<T>;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitStatus(pub i32);
+pub struct Status(pub i32);
 
-impl ExitStatus {
+impl Status {
     pub fn is_success(self) -> bool {
         self == Self::SUCCESS
     }
 }
 
-impl ExitStatus {
+impl Status {
     pub const SUCCESS: Self = Self(0);
     pub const FAILURE: Self = Self(1);
 }
 
-impl fmt::Display for ExitStatus {
+impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl From<i32> for ExitStatus {
+impl From<i32> for Status {
     fn from(n: i32) -> Self {
         Self(n)
     }
 }
 
-impl From<bool> for ExitStatus {
+impl From<bool> for Status {
     fn from(b: bool) -> Self {
         match b {
             true => Self::SUCCESS,
@@ -58,51 +62,69 @@ impl From<bool> for ExitStatus {
     }
 }
 
+type ExecControlFlow = ControlFlow<ExecBreak>;
+
+#[derive(Debug, Clone)]
+pub enum ExecBreak {
+    LoopBreak,
+    LoopContinue,
+    FuncReturn(Status),
+}
+
 pub type Value = String;
 pub type ValueList = Vec<String>;
 
+/// An error triggered at runtime.
+///
+/// Typically, it will not break the execution but only print a message and set a non-zero status
+/// code.
+/// [`ExecContext::emit_error`] can be used to report it with backtrace and get a coresponding
+/// [`ExitStatus`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    // User errors.
     #[error("{0}")]
     Custom(String),
-    #[error("io error: {0}")]
-    Io(std::io::Error),
-
-    #[error("invalid UTF8 in {0}")]
-    InvalidUtf8(String),
     #[error("invalid options: {0}")]
     InvalidOptions(clap::Error),
     #[error("invalid identifier: {0:?}")]
-    InvalidateIdentifier(String),
-    #[error("expecting an identifier, found a list with {0} elements")]
-    InvalidateIdentifierWords(usize),
+    InvalidIdentifier(String),
+    #[error("invalid integer: {0:?}")]
+    InvalidInteger(String),
+    #[error("expecting a single word, got {0} words")]
+    NotOneWord(usize),
     #[error("empty command")]
     EmptyCommand,
     #[error("command not found: {0:?}")]
     CommandNotFound(String),
-    #[error("invalid redirection target")]
-    InvalidRedirectionTarget,
+    #[error("variable not found: {0:?}")]
+    VariableNotFound(String),
+
+    // System errors.
+    #[error("read/write error: {0}")]
+    ReadWrite(io::Error),
     #[error("failed open redirection file {0:?}: {1}")]
     OpenRedirectionFile(PathBuf, io::Error),
     #[error("failed to spawn process {0:?}: {1}")]
     SpawnProcess(PathBuf, io::Error),
-    #[error("variable not found: {0:?}")]
-    VariableNotFound(String),
     #[error("pipe closed")]
     PipeClosed,
-
     #[error("failed to create pipe: {0}")]
     CreatePipe(io::Error),
     #[error("failed to clone fd: {0}")]
     CloneHandle(io::Error),
     #[error("failed to wait process: {0}")]
     WaitProcess(io::Error),
+
+    // TODO
+    #[error("invalid UTF8 in {0}")]
+    InvalidUtf8(String),
 }
 
 impl Error {
-    pub fn to_status(&self) -> ExitStatus {
+    pub fn to_status(&self) -> Status {
         // TODO
-        ExitStatus::FAILURE
+        Status::FAILURE
     }
 }
 
@@ -136,19 +158,21 @@ impl fmt::Debug for Stdio {
 }
 
 impl Io {
-    pub fn write_stdout(&self, s: impl fmt::Display) -> ExecResult {
+    pub async fn write_stdout(&self, bytes: impl AsRef<[u8]>) -> ExecResult {
+        let bytes = bytes.as_ref();
         match &self.stdout {
-            // FIXME: how to async write stdout?
             Stdio::Inherit => {
-                std::io::stdout()
-                    .lock()
-                    .write_fmt(format_args!("{s}"))
-                    .map_err(Error::Io)?;
-                Ok(ExitStatus::SUCCESS)
+                tokio::io::stdout()
+                    .write_all(bytes)
+                    .await
+                    .map_err(Error::ReadWrite)?;
+                Ok(Status::SUCCESS)
             }
             Stdio::Close => Err(Error::PipeClosed),
-            Stdio::Collect(sink) => sink(s.to_string().as_bytes()),
-            Stdio::Raw(_) => todo!(),
+            Stdio::Collect(sink) => sink(bytes),
+            Stdio::Raw(_) => {
+                todo!()
+            }
         }
     }
 }
@@ -286,7 +310,7 @@ pub struct ExecContext<'a> {
     func_vars: BTreeMap<String, Variable>,
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
-    last_status: ExitStatus,
+    last_status: Status,
     io: Io,
 }
 
@@ -304,7 +328,7 @@ impl<'a> ExecContext<'a> {
             func_vars: BTreeMap::new(),
             root,
             outer: None,
-            last_status: ExitStatus::SUCCESS,
+            last_status: Status::SUCCESS,
             io: Io::default(),
         }
     }
@@ -314,16 +338,16 @@ impl<'a> ExecContext<'a> {
             func_vars: BTreeMap::new(),
             root: outer.root,
             outer: Some(outer),
-            last_status: ExitStatus::SUCCESS,
+            last_status: Status::SUCCESS,
             io: outer.io.clone(),
         }
     }
 
-    pub fn last_status(&self) -> ExitStatus {
+    pub fn last_status(&self) -> Status {
         self.last_status
     }
 
-    pub fn set_last_status(&mut self, n: impl Into<ExitStatus>) {
+    pub fn set_last_status(&mut self, n: impl Into<Status>) {
         self.last_status = n.into();
     }
 
@@ -333,6 +357,14 @@ impl<'a> ExecContext<'a> {
 
     pub fn backtrace(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |ctx| ctx.outer)
+    }
+
+    pub async fn emit_error(&mut self, err: Error) -> Status {
+        // TODO: Backtrace.
+        let _: ExecResult<_> = self.io().write_stdout(format!("{err}\n")).await;
+        let st = err.to_status();
+        self.set_last_status(st);
+        st
     }
 
     pub fn list_funcs<B>(
@@ -432,83 +464,125 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    pub async fn exec_stmts(&mut self, stmts: &[Stmt]) -> ExecResult {
-        let mut last = ExitStatus::SUCCESS;
-        for s in stmts {
-            last = self.exec_stmt(s).await?;
+    pub async fn exec_source(&mut self, src: &SourceFile) -> ExecControlFlow {
+        for stmt in &src.stmts {
+            self.exec_stmt(stmt).await?;
         }
-        Ok(last)
+        ControlFlow::Continue(())
     }
 
-    pub async fn exec_stmt(&mut self, stmt: &Stmt) -> ExecResult {
-        let ret = Box::pin(self.exec_stmt_inner(stmt)).await;
-        let st = match &ret {
-            Ok(n) => *n,
-            Err(err) => err.to_status(),
-        };
-        self.set_last_status(st);
-        ret
+    async fn exec_stmt(&mut self, stmt: &Stmt) -> ExecControlFlow {
+        Box::pin(self.exec_stmt_inner(stmt)).await
     }
 
-    async fn exec_stmt_inner(&mut self, stmt: &Stmt) -> ExecResult {
+    async fn exec_stmt_inner(&mut self, stmt: &Stmt) -> ExecControlFlow {
+        macro_rules! bail {
+            ($err:expr) => {
+                bail!(self, $err)
+            };
+            ($this:expr, $err:expr) => {{
+                $this.emit_error($err).await;
+                return ControlFlow::Continue(());
+            }};
+        }
+        macro_rules! tri {
+            ($e:expr) => {
+                tri!(self, $e)
+            };
+            ($this:expr, $e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(err) => bail!($this, err),
+                }
+            };
+        }
+
         match stmt {
             Stmt::Command(_pos, words) => {
-                let words = self.expand_words(words).await?;
-                self.exec_command(&words).await
+                let words = self.expand_words(words).await;
+                self.exec_command(&words).await;
             }
-            Stmt::Block(_pos, stmts) => Box::pin(self.exec_stmts(stmts)).await,
+            Stmt::Block(_pos, stmts) => {
+                for stmt in stmts {
+                    self.exec_stmt(stmt).await?;
+                }
+            }
             Stmt::If(_pos, cond, then, else_) => {
                 self.exec_stmt(cond).await?;
                 if self.last_status().is_success() {
-                    self.exec_stmt(then).await
+                    self.exec_stmt(then).await?;
                 } else if let Some(else_) = else_ {
-                    self.exec_stmt(else_).await
-                } else {
-                    Ok(ExitStatus::SUCCESS)
+                    self.exec_stmt(else_).await?;
                 }
             }
             Stmt::Switch(..) => todo!(),
             Stmt::While(_pos, cond, body) => loop {
                 self.exec_stmt(cond).await?;
                 if !self.last_status().is_success() {
-                    break Ok(self.last_status());
+                    break;
                 }
-                self.exec_stmt(body).await?;
+                match self.exec_stmt(body).await {
+                    ControlFlow::Break(ExecBreak::LoopContinue) => {}
+                    ControlFlow::Break(ExecBreak::LoopBreak) => break,
+                    ctl => return ctl,
+                }
             },
             Stmt::For(_pos, var, elem_ws, body) => {
-                let var = self.expand_words(slice::from_ref(var)).await?;
-                let var = validate_variable_words(&var)?;
-                let elems = self.expand_words(elem_ws).await?;
+                let var = self.expand_words(slice::from_ref(var)).await;
+                if var.len() != 1 {
+                    bail!(Error::NotOneWord(var.len()));
+                }
+                let var = tri!(validate_variable_name(&var[0]));
+                let elems = self.expand_words(elem_ws).await;
                 for elem in elems {
                     self.set_var(var, VarScope::default(), elem);
-                    self.exec_stmt(body).await?;
+                    match self.exec_stmt(body).await {
+                        ControlFlow::Break(ExecBreak::LoopContinue) => {}
+                        ControlFlow::Break(ExecBreak::LoopBreak) => break,
+                        ctl => ctl?,
+                    }
                 }
-                Ok(self.last_status())
             }
-            Stmt::Break(_pos) => todo!(),
-            Stmt::Continue(_pos) => todo!(),
+            Stmt::Break(_pos) => return ControlFlow::Break(ExecBreak::LoopBreak),
+            Stmt::Continue(_pos) => return ControlFlow::Break(ExecBreak::LoopContinue),
             Stmt::Function(_pos, words, stmt) => {
-                let words = &*self.expand_words(words).await?;
-                let name = words.first().ok_or(Error::InvalidateIdentifierWords(0))?;
-                validate_function_name(name)?;
-                let desc = match <FunctionOpts as clap::Parser>::try_parse_from(words) {
-                    Ok(opts) => opts.description,
-                    Err(err) => return Err(Error::InvalidOptions(err)),
-                };
-                let user_func = UserFunc::new((**stmt).clone(), desc);
+                let words = &*self.expand_words(words).await;
+                let name = tri!(words.first().ok_or(Error::NotOneWord(0)));
+                let name = tri!(validate_function_name(name));
+                let opts = tri!(
+                    <FunctionOpts as clap::Parser>::try_parse_from(words)
+                        .map_err(Error::InvalidOptions)
+                );
+                let user_func = UserFunc::new((**stmt).clone(), opts.description);
                 self.set_global_func(name.into(), user_func);
-                Ok(ExitStatus::SUCCESS)
             }
-            Stmt::Return(..) => todo!(),
+            Stmt::Return(_, w) => {
+                let st = match w {
+                    None => Status::SUCCESS,
+                    Some(w) => {
+                        let expanded = self.expand_words(slice::from_ref(w)).await;
+                        match &expanded[..] {
+                            [] => Status::SUCCESS,
+                            [n] => {
+                                let n =
+                                    tri!(n.parse().map_err(|_| Error::InvalidInteger(n.into())));
+                                Status(n)
+                            }
+                            _ => bail!(Error::NotOneWord(expanded.len())),
+                        }
+                    }
+                };
+                return ControlFlow::Break(ExecBreak::FuncReturn(st));
+            }
             Stmt::Redirect(_pos, stmt, redirects) => {
                 let prev_io = self.io().clone();
                 let mut this = scopeguard::guard(&mut *self, |this| this.io = prev_io);
 
                 for redir in redirects {
                     let (RedirectDest::File(file_word) | RedirectDest::Fd(file_word)) = &redir.dest;
-                    let expanded = this.expand_words(slice::from_ref(file_word)).await?;
+                    let expanded = this.expand_words(slice::from_ref(file_word)).await;
                     let [file_path] = &*expanded else {
-                        return Err(Error::InvalidRedirectionTarget);
+                        bail!(this, Error::NotOneWord(expanded.len()));
                     };
                     match redir.dest {
                         RedirectDest::File(_) => {}
@@ -521,9 +595,11 @@ impl<'a> ExecContext<'a> {
                         RedirectMode::WriteNoClobber => opt.write(true).create_new(true),
                         RedirectMode::Append => opt.append(true).create(true),
                     };
-                    let f = opt
-                        .open(file_path)
-                        .map_err(|err| Error::OpenRedirectionFile(file_path.into(), err))?;
+                    let f = tri!(
+                        this,
+                        opt.open(file_path)
+                            .map_err(|err| Error::OpenRedirectionFile(file_path.into(), err))
+                    );
                     let f = Stdio::Raw(Rc::new(OwnedFd::from(f)));
 
                     match redir.port {
@@ -536,10 +612,10 @@ impl<'a> ExecContext<'a> {
                     }
                 }
 
-                this.exec_stmt(stmt).await
+                this.exec_stmt(stmt).await?;
             }
             Stmt::Pipe(_pos, port, lhs, rhs) => {
-                let (pipe_r, pipe_w) = os_pipe::pipe().map_err(Error::CreatePipe)?;
+                let (pipe_r, pipe_w) = tri!(os_pipe::pipe().map_err(Error::CreatePipe));
                 let pipe_r = Stdio::Raw(Rc::new(pipe_r.into()));
                 let pipe_w = Stdio::Raw(Rc::new(pipe_w.into()));
 
@@ -555,40 +631,49 @@ impl<'a> ExecContext<'a> {
                 }
                 rctx.io.stdin = pipe_r;
 
-                let (ret1, ret2) = tokio::join!(
-                    Box::pin(async move { lctx.exec_stmt(lhs).await }),
-                    Box::pin(async move { rctx.exec_stmt(rhs).await }),
+                let (_st1, st2) = tokio::join!(
+                    Box::pin(async move {
+                        lctx.exec_stmt(lhs).await;
+                        lctx.last_status()
+                    }),
+                    Box::pin(async move {
+                        rctx.exec_stmt(rhs).await;
+                        rctx.last_status()
+                    }),
                 );
                 // TODO: pipestatus
-                ret1?;
-                ret2
+                self.set_last_status(st2);
             }
             Stmt::Not(_pos, stmt) => {
-                let n = self.exec_stmt(stmt).await?;
-                Ok((!n.is_success()).into())
+                self.exec_stmt(stmt).await?;
+                let ok = self.last_status().is_success();
+                self.set_last_status(!ok);
             }
             Stmt::And(_pos, stmt) => {
                 if self.last_status.is_success() {
-                    self.exec_stmt(stmt).await
-                } else {
-                    Ok(self.last_status)
+                    self.exec_stmt(stmt).await?;
                 }
             }
             Stmt::Or(_pos, stmt) => {
-                if self.last_status.is_success() {
-                    Ok(self.last_status)
-                } else {
-                    self.exec_stmt(stmt).await
+                if !self.last_status.is_success() {
+                    self.exec_stmt(stmt).await?;
                 }
             }
         }
+
+        ControlFlow::Continue(())
     }
 
-    pub async fn exec_command(&mut self, words: &[String]) -> ExecResult {
-        let cmd = words.first().ok_or(Error::EmptyCommand)?;
+    pub async fn exec_command(&mut self, words: &[String]) {
+        let Some(cmd) = words.first() else {
+            self.emit_error(Error::EmptyCommand).await;
+            return;
+        };
 
         if let Some(cmd) = self.get_func(cmd) {
-            return cmd.exec(self, words).await;
+            let st = cmd.exec(self, words).await;
+            self.set_last_status(st);
+            return;
         }
 
         let args = builtins::CommandArgs {
@@ -597,11 +682,12 @@ impl<'a> ExecContext<'a> {
             search: false,
             args: words.to_vec(),
         };
-        builtins::command(self, args).await
+        let st = builtins::command(self, args).await.report(self).await;
+        self.set_last_status(st);
     }
 
     // TODO: Word and size limit.
-    async fn expand_words(&mut self, words: &[ast::Word]) -> Result<Vec<String>> {
+    async fn expand_words(&mut self, words: &[ast::Word]) -> Vec<String> {
         fn dfs(
             ret: &mut Vec<String>,
             stack: &mut String,
@@ -652,13 +738,19 @@ impl<'a> ExecContext<'a> {
             for frag in frags {
                 match frag {
                     WordFrag::Literal(_) => {}
-                    WordFrag::Variable(var) | WordFrag::VariableNoSplit(var) => {
-                        let var = self
-                            .get_var(var)
-                            .ok_or_else(|| Error::VariableNotFound(var.into()))?;
-                        let vals = &var.value;
+                    WordFrag::Variable(var_name) | WordFrag::VariableNoSplit(var_name) => {
+                        let var = self.get_var(var_name);
+                        let vals = match &var {
+                            Some(var) => &var.value[..],
+                            None => {
+                                drop(var);
+                                self.emit_error(Error::VariableNotFound(var_name.into()))
+                                    .await;
+                                &[]
+                            }
+                        };
                         if matches!(frag, WordFrag::Variable(_)) {
-                            expanded.push(vals.clone());
+                            expanded.push(vals.to_vec());
                         } else {
                             expanded.push(vec![vals.join(" ")]);
                         }
@@ -674,14 +766,13 @@ impl<'a> ExecContext<'a> {
                                     .ok_or(Error::PipeClosed)?
                                     .borrow_mut()
                                     .extend_from_slice(bytes);
-                                Ok(ExitStatus::SUCCESS)
+                                Ok(Status::SUCCESS)
                             }));
                             let prev_stdout = std::mem::replace(&mut self.io.stdout, io_collect);
                             let mut this = scopeguard::guard(&mut *self, move |this| {
                                 this.io.stdout = prev_stdout
                             });
-                            // TODO: check status?
-                            this.exec_stmt(stmt).await?;
+                            this.exec_stmt(stmt).await;
                             Rc::into_inner(buf).unwrap().into_inner()
                         };
                         let mut buf = String::from_utf8(buf).expect("TODO");
@@ -697,7 +788,7 @@ impl<'a> ExecContext<'a> {
                     WordFrag::Brace(words) => {
                         let mut alts = Vec::with_capacity(words.len());
                         for w in words {
-                            let mut vals = Box::pin(self.expand_words(slice::from_ref(w))).await?;
+                            let mut vals = Box::pin(self.expand_words(slice::from_ref(w))).await;
                             if vals.len() != 1 {
                                 todo!();
                             }
@@ -714,6 +805,6 @@ impl<'a> ExecContext<'a> {
             dfs(&mut ret, &mut String::new(), frags, &expanded);
         }
 
-        Ok(ret)
+        ret
     }
 }

@@ -274,6 +274,7 @@ pub struct ExecContext<'a> {
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
     last_status: ExitStatus,
+    io: Io,
 }
 
 impl Deref for ExecContext<'_> {
@@ -291,6 +292,7 @@ impl<'a> ExecContext<'a> {
             root,
             outer: None,
             last_status: ExitStatus::SUCCESS,
+            io: Io::default(),
         }
     }
 
@@ -300,6 +302,7 @@ impl<'a> ExecContext<'a> {
             root: outer.root,
             outer: Some(outer),
             last_status: ExitStatus::SUCCESS,
+            io: outer.io.clone(),
         }
     }
 
@@ -309,6 +312,10 @@ impl<'a> ExecContext<'a> {
 
     pub fn set_last_status(&mut self, n: impl Into<ExitStatus>) {
         self.last_status = n.into();
+    }
+
+    pub fn io(&self) -> &Io {
+        &self.io
     }
 
     pub fn backtrace(&self) -> impl Iterator<Item = &Self> {
@@ -405,16 +412,16 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    pub async fn exec_stmts(&mut self, stmts: &[Stmt], io: Io) -> ExecResult {
+    pub async fn exec_stmts(&mut self, stmts: &[Stmt]) -> ExecResult {
         let mut last = ExitStatus::SUCCESS;
         for s in stmts {
-            last = self.exec_stmt(s, io.clone()).await?;
+            last = self.exec_stmt(s).await?;
         }
         Ok(last)
     }
 
-    pub async fn exec_stmt(&mut self, stmt: &Stmt, io: Io) -> ExecResult {
-        let ret = Box::pin(self.exec_stmt_inner(stmt, io)).await;
+    pub async fn exec_stmt(&mut self, stmt: &Stmt) -> ExecResult {
+        let ret = Box::pin(self.exec_stmt_inner(stmt)).await;
         let st = match &ret {
             Ok(n) => *n,
             Err(err) => err.to_status(),
@@ -423,30 +430,30 @@ impl<'a> ExecContext<'a> {
         ret
     }
 
-    async fn exec_stmt_inner(&mut self, stmt: &Stmt, mut io: Io) -> ExecResult {
+    async fn exec_stmt_inner(&mut self, stmt: &Stmt) -> ExecResult {
         match stmt {
             Stmt::Command(words) => {
                 let words = self.expand_words(words).await?;
-                self.exec_command(&words, io).await
+                self.exec_command(&words).await
             }
-            Stmt::Block(stmts) => Box::pin(self.exec_stmts(stmts, io)).await,
+            Stmt::Block(stmts) => Box::pin(self.exec_stmts(stmts)).await,
             Stmt::If(cond, then, else_) => {
-                self.exec_stmt(cond, io.clone()).await?;
+                self.exec_stmt(cond).await?;
                 if self.last_status().is_success() {
-                    self.exec_stmt(then, io).await
+                    self.exec_stmt(then).await
                 } else if let Some(else_) = else_ {
-                    self.exec_stmt(else_, io).await
+                    self.exec_stmt(else_).await
                 } else {
                     Ok(ExitStatus::SUCCESS)
                 }
             }
             Stmt::Switch(_, _) => todo!(),
             Stmt::While(cond, body) => loop {
-                self.exec_stmt(cond, io.clone()).await?;
+                self.exec_stmt(cond).await?;
                 if !self.last_status().is_success() {
                     break Ok(self.last_status());
                 }
-                self.exec_stmt(body, io.clone()).await?;
+                self.exec_stmt(body).await?;
             },
             Stmt::For(var, elem_ws, body) => {
                 let var = self.expand_words(slice::from_ref(var)).await?;
@@ -454,7 +461,7 @@ impl<'a> ExecContext<'a> {
                 let elems = self.expand_words(elem_ws).await?;
                 for elem in elems {
                     self.set_var(var, VarScope::default(), [elem]);
-                    self.exec_stmt(body, io.clone()).await?;
+                    self.exec_stmt(body).await?;
                 }
                 Ok(self.last_status())
             }
@@ -475,9 +482,12 @@ impl<'a> ExecContext<'a> {
             }
             Stmt::Return(_) => todo!(),
             Stmt::Redirect(stmt, redirects) => {
+                let prev_io = self.io().clone();
+                let mut this = scopeguard::guard(&mut *self, |this| this.io = prev_io);
+
                 for redir in redirects {
                     let (RedirectDest::File(file_word) | RedirectDest::Fd(file_word)) = &redir.dest;
-                    let expanded = self.expand_words(slice::from_ref(file_word)).await?;
+                    let expanded = this.expand_words(slice::from_ref(file_word)).await?;
                     let [file_path] = &*expanded else {
                         return Err(Error::InvalidRedirectionTarget);
                     };
@@ -498,50 +508,49 @@ impl<'a> ExecContext<'a> {
                     let f = Stdio::Raw(Rc::new(OwnedFd::from(f)));
 
                     match redir.port {
-                        RedirectPort::STDIN => io.stdin = f,
-                        RedirectPort::STDOUT => io.stdout = f,
-                        RedirectPort::STDOUT_STDERR => (io.stdout, io.stderr) = (f.clone(), f),
+                        RedirectPort::STDIN => this.io.stdin = f,
+                        RedirectPort::STDOUT => this.io.stdout = f,
+                        RedirectPort::STDOUT_STDERR => {
+                            (this.io.stdout, this.io.stderr) = (f.clone(), f)
+                        }
                         _ => todo!(),
                     }
                 }
 
-                self.exec_stmt(stmt, io).await
+                this.exec_stmt(stmt).await
             }
             Stmt::Pipe(port, lhs, rhs) => {
                 let (pipe_r, pipe_w) = os_pipe::pipe().map_err(Error::CreatePipe)?;
                 let pipe_r = Stdio::Raw(Rc::new(pipe_r.into()));
                 let pipe_w = Stdio::Raw(Rc::new(pipe_w.into()));
 
-                let mut lhs_io = io.clone();
+                let mut lctx = ExecContext::new_inside(self);
+                let mut rctx = ExecContext::new_inside(self);
                 match *port {
-                    RedirectPort::STDOUT => lhs_io.stdout = pipe_w,
-                    RedirectPort::STDERR => lhs_io.stderr = pipe_w,
+                    RedirectPort::STDOUT => lctx.io.stdout = pipe_w,
+                    RedirectPort::STDERR => lctx.io.stderr = pipe_w,
                     RedirectPort::STDOUT_STDERR => {
-                        (lhs_io.stdout, lhs_io.stderr) = (pipe_w.clone(), pipe_w)
+                        (lctx.io.stdout, lctx.io.stderr) = (pipe_w.clone(), pipe_w)
                     }
                     _ => todo!(),
                 }
-                let rhs_io = Io {
-                    stdin: pipe_r,
-                    ..io.clone()
-                };
+                rctx.io.stdin = pipe_r;
 
-                let mut lhs_ctx = ExecContext::new_inside(self);
-                let mut rhs_ctx = ExecContext::new_inside(self);
-                let (_ret1, ret2) = tokio::join!(
-                    Box::pin(async move { lhs_ctx.exec_stmt(lhs, lhs_io).await }),
-                    Box::pin(async move { rhs_ctx.exec_stmt(rhs, rhs_io).await }),
+                let (ret1, ret2) = tokio::join!(
+                    Box::pin(async move { lctx.exec_stmt(lhs).await }),
+                    Box::pin(async move { rctx.exec_stmt(rhs).await }),
                 );
                 // TODO: pipestatus
+                ret1?;
                 ret2
             }
             Stmt::Not(stmt) => {
-                let n = self.exec_stmt(stmt, io).await?;
+                let n = self.exec_stmt(stmt).await?;
                 Ok((!n.is_success()).into())
             }
             Stmt::And(stmt) => {
                 if self.last_status.is_success() {
-                    self.exec_stmt(stmt, io).await
+                    self.exec_stmt(stmt).await
                 } else {
                     Ok(self.last_status)
                 }
@@ -550,17 +559,17 @@ impl<'a> ExecContext<'a> {
                 if self.last_status.is_success() {
                     Ok(self.last_status)
                 } else {
-                    self.exec_stmt(stmt, io.clone()).await
+                    self.exec_stmt(stmt).await
                 }
             }
         }
     }
 
-    pub async fn exec_command(&mut self, words: &[String], io: Io) -> ExecResult {
+    pub async fn exec_command(&mut self, words: &[String]) -> ExecResult {
         let cmd = words.first().ok_or(Error::EmptyCommand)?;
 
         if let Some(cmd) = self.get_func(cmd) {
-            return cmd.exec(self, words, io).await;
+            return cmd.exec(self, words).await;
         }
 
         let args = builtins::CommandArgs {
@@ -569,7 +578,7 @@ impl<'a> ExecContext<'a> {
             search: false,
             args: words.to_vec(),
         };
-        builtins::command(self, args, io).await
+        builtins::command(self, args).await
     }
 
     // TODO: Word and size limit.
@@ -635,23 +644,26 @@ impl<'a> ExecContext<'a> {
                         }
                     }
                     WordFrag::Command(stmt) | WordFrag::CommandNoSplit(stmt) => {
-                        let buf = Rc::new(RefCell::new(Vec::new()));
-                        let buf_weak = Rc::downgrade(&buf);
-                        let io = Io {
+                        let buf = {
+                            let buf = Rc::new(RefCell::new(Vec::new()));
+                            let buf_weak = Rc::downgrade(&buf);
                             // FIXME: Avoid double Rc?
-                            stdout: Stdio::Collect(Rc::new(move |bytes| {
+                            let io_collect = Stdio::Collect(Rc::new(move |bytes| {
                                 buf_weak
                                     .upgrade()
                                     .ok_or(Error::PipeClosed)?
                                     .borrow_mut()
                                     .extend_from_slice(bytes);
                                 Ok(ExitStatus::SUCCESS)
-                            })),
-                            ..Io::default()
+                            }));
+                            let prev_stdout = std::mem::replace(&mut self.io.stdout, io_collect);
+                            let mut this = scopeguard::guard(&mut *self, move |this| {
+                                this.io.stdout = prev_stdout
+                            });
+                            // TODO: check status?
+                            this.exec_stmt(stmt).await?;
+                            Rc::into_inner(buf).unwrap().into_inner()
                         };
-                        // TODO: check status?
-                        let _ret = self.exec_stmt(stmt, io).await;
-                        let buf = Rc::into_inner(buf).unwrap().into_inner();
                         let mut buf = String::from_utf8(buf).expect("TODO");
 
                         if let WordFrag::CommandNoSplit(_) = frag {

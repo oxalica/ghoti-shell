@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::command::{BoxCommand, Builtin};
 use crate::utils::validate_variable_name;
-use crate::{Error, ExecContext, ExecResult, ExitStatus, Io, Stdio, StdioCollectSink, VarScope};
+use crate::{Error, ExecContext, ExecResult, ExitStatus, Stdio, StdioCollectSink, VarScope};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand)> {
     [
@@ -51,7 +51,7 @@ pub struct SetArgs {
     args: Vec<String>,
 }
 
-pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs, io: Io) -> ExecResult {
+pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
     let scope_flag_cnt = [args.local, args.function, args.global, args.universal]
         .iter()
         .map(|&b| b as u8)
@@ -84,7 +84,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs, io: Io) -> ExecResult
                 buf.push('\n');
                 ControlFlow::Continue(())
             });
-            io.write_stdout(buf)
+            ctx.io().write_stdout(buf)
         }
         Some((name, vals)) => {
             validate_variable_name(name)?;
@@ -105,7 +105,7 @@ pub struct BuiltinArgs {
     args: Vec<String>,
 }
 
-pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs, io: Io) -> ExecResult {
+pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult {
     ensure!(
         !(args.names && args.query),
         "--names and --query are mutually exclusive"
@@ -114,7 +114,7 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs, io: Io) -> Ex
         let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
         names.sort_unstable();
         let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
-        io.write_stdout(out)
+        ctx.io().write_stdout(out)
     } else if args.query {
         let ok = args.args.iter().any(|name| ctx.get_builtin(name).is_some());
         Ok(ok.into())
@@ -124,7 +124,7 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs, io: Io) -> Ex
             .get_builtin(&args.args[0])
             .ok_or_else(|| todo!())?
             .clone();
-        cmd.exec(ctx, &args.args, io).await
+        cmd.exec(ctx, &args.args).await
     }
 }
 
@@ -141,7 +141,7 @@ pub struct CommandArgs {
     pub args: Vec<String>,
 }
 
-pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> ExecResult {
+pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult {
     async fn copy_stdio_to_sink(rdr: impl AsyncRead + Unpin, sink: StdioCollectSink) -> ExecResult {
         let mut stdout = tokio::io::BufReader::new(rdr);
         loop {
@@ -159,7 +159,7 @@ pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> E
 
     let (cmd, args) = args.args.split_first().ok_or(Error::EmptyCommand)?;
 
-    let cvt_stdio = |s: Stdio, is_stdin: bool| {
+    let cvt_stdio = |s: &Stdio, is_stdin: bool| {
         Ok(match s {
             Stdio::Inherit => (process::Stdio::inherit(), None),
             Stdio::Close => todo!(),
@@ -167,20 +167,19 @@ pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> E
                 if is_stdin {
                     todo!();
                 }
-                (process::Stdio::piped(), Some(sink))
+                (process::Stdio::piped(), Some(Rc::clone(sink)))
             }
             Stdio::Raw(raw) => (
-                Rc::try_unwrap(raw)
-                    .or_else(|raw| raw.try_clone().map_err(Error::CloneHandle))?
-                    .into(),
+                (**raw).try_clone().map_err(Error::CloneHandle)?.into(),
                 None,
             ),
         })
     };
 
-    let (os_stdin, _) = cvt_stdio(io.stdin, true)?;
-    let (os_stdout, stdout_sink) = cvt_stdio(io.stdout, false)?;
-    let (os_stderr, stderr_sink) = cvt_stdio(io.stderr, false)?;
+    let io = ctx.io();
+    let (os_stdin, _) = cvt_stdio(&io.stdin, true)?;
+    let (os_stdout, stdout_sink) = cvt_stdio(&io.stdout, false)?;
+    let (os_stderr, stderr_sink) = cvt_stdio(&io.stderr, false)?;
     let mut child = tokio::process::Command::new(cmd)
         .kill_on_drop(true)
         .args(args)

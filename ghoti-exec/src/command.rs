@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use ghoti_syntax::Stmt;
 
-use crate::{Error, ExecContext, ExecResult, Io, VarScope};
+use crate::{Error, ExecContext, ExecResult, VarScope};
 
 pub type BoxCommand = Box<dyn Command>;
 
@@ -21,7 +21,6 @@ pub trait Command: fmt::Debug + dyn_clone::DynClone + 'static {
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-        io: Io,
     ) -> BoxFuture<'fut, ExecResult>;
 
     fn description(&self) -> Option<&str> {
@@ -53,18 +52,17 @@ impl<F: Clone, Args> Clone for Builtin<F, Args> {
 
 impl<F, Args> Command for Builtin<F, Args>
 where
-    F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args, Io) -> ExecResult,
+    F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args) -> ExecResult,
     Args: 'static + argh::FromArgs,
 {
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-        io: Io,
     ) -> BoxFuture<'fut, ExecResult> {
         let strs = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         match <Args as argh::FromArgs>::from_args(&[strs[0]], &strs[1..]) {
-            Ok(parsed) => Box::pin((self.func)(ctx, parsed, io)),
+            Ok(parsed) => Box::pin((self.func)(ctx, parsed)),
             Err(err) => Box::pin(std::future::ready(Err(Error::InvalidOptions(err.output)))),
         }
     }
@@ -87,12 +85,11 @@ impl Command for UserFunc {
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-        io: Io,
     ) -> BoxFuture<'fut, ExecResult> {
         Box::pin(async move {
             let mut subctx = ExecContext::new_inside(ctx);
             subctx.set_var("argv", VarScope::Function, args[1..].to_vec());
-            subctx.exec_stmt(&self.0.0, io).await
+            subctx.exec_stmt(&self.0.0).await
         })
     }
 

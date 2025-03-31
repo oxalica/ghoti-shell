@@ -286,6 +286,7 @@ dependencies = [
  "ghoti-syntax",
  "itertools",
  "os_pipe",
+ "scopeguard",
  "thiserror",
  "tokio",
 ]

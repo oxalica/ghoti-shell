@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use annotate_snippets::{Level, Renderer, Snippet};
-use ghoti_exec::{ExecContext, ExitStatus, Io};
+use ghoti_exec::{ExecContext, ExitStatus};
 use ghoti_syntax::parse_source;
 use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
@@ -103,7 +103,7 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
             }
         };
 
-        let ret = rt.block_on(ctx.exec_stmts(&src.stmts, Io::default()));
+        let ret = rt.block_on(ctx.exec_stmts(&src.stmts));
         // Prevent next prompt from clobbering the output if it contains no newline.
         println!();
 

@@ -136,13 +136,7 @@ RedirectMode: RedirectMode = {
 };
 
 StmtBlock: Stmt =
-    <mut s:StmtList> => {
-        if s.len() == 1 {
-            s.pop().unwrap()
-        } else {
-            Stmt::Block(<>)
-        }
-    };
+    <StmtList> => Stmt::Block(<>);
 
 Control: Stmt = {
     "begin" EOS <StmtBlock> "end",

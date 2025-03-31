@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
 
 use annotate_snippets::{Level, Renderer, Snippet};
 use ghoti_exec::{ExecContext, ExitStatus, Io};
-use ghoti_syntax::parse::parse_source;
+use ghoti_syntax::parse_source;
 use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -89,12 +89,14 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
 
         let src = match parse_source(&input) {
             Ok(src) => src,
-            Err(err) => {
-                let msg = err.kind.to_string();
-                let msg = Level::Error
-                    .title(&msg)
-                    .snippet(Snippet::source(&input).annotation(Level::Error.span(err.span())));
-                println!("{}", renderer.render(msg));
+            Err(errs) => {
+                for err in errs {
+                    let msg = err.kind.to_string();
+                    let msg = Level::Error
+                        .title(&msg)
+                        .snippet(Snippet::source(&input).annotation(Level::Error.span(err.span())));
+                    println!("{}", renderer.render(msg));
+                }
 
                 ctx.set_last_status(ExitStatus(127));
                 continue;

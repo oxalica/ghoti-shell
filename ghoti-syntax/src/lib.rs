@@ -2,7 +2,15 @@ use std::fmt;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
+mod error;
 pub mod parse;
+mod validate;
+pub mod visit;
+
+#[cfg(test)]
+mod tests;
+
+pub use error::{ParseError, ParseErrorKind};
 
 pub const KEYWORDS: &[&str] = &[
     "begin", "end", "if", "else", "switch", "case", "for", "in", "and", "or", "not", "function",
@@ -153,4 +161,10 @@ pub enum WordFrag {
     TildeSegment,
     Wildcard,
     WildcardRecursive,
+}
+
+pub fn parse_source(src: &str) -> Result<SourceFile, Vec<ParseError>> {
+    let mut file = parse::parse_source(src).map_err(|err| vec![err])?;
+    validate::validate_fixup(&mut file)?;
+    Ok(file)
 }

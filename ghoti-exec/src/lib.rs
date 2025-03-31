@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::{fmt, slice};
 
 use builtins::FunctionOpts;
-use command::{BoxCommand, Command, ReportResult, UserFunc};
+use command::{BoxCommand, Command, ReportResult};
 use either::Either;
 use ghoti_syntax::{
     self as ast, RedirectDest, RedirectMode, RedirectPort, SourceFile, Stmt, WordFrag,
@@ -555,7 +555,7 @@ impl<'a> ExecContext<'a> {
                     <FunctionOpts as clap::Parser>::try_parse_from(words)
                         .map_err(Error::InvalidOptions)
                 );
-                let user_func = UserFunc::new((**stmt).clone(), opts.description);
+                let user_func = command::user_func((**stmt).clone(), opts.description);
                 self.set_global_func(name.into(), user_func);
             }
             Stmt::Return(_, w) => {

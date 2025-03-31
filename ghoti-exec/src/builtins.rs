@@ -6,17 +6,24 @@ use std::rc::Rc;
 
 use clap::Parser;
 use either::Either;
+use ghoti_syntax::parse_source;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
-use crate::command::{BoxCommand, Builtin};
+use crate::command::{self, BoxCommand, UnchangedStatus};
 use crate::utils::validate_variable_name;
-use crate::{Error, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable};
+use crate::{
+    Error, ExecBreak, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable,
+};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand)> {
     [
-        ("command", Box::new(Builtin::new(command)) as BoxCommand),
-        ("set", Box::new(Builtin::new(set))),
-        ("builtin", Box::new(Builtin::new(builtin))),
+        (
+            "command",
+            Box::new(command::parsed_builtin(command)) as BoxCommand,
+        ),
+        ("set", Box::new(command::parsed_builtin(set))),
+        ("builtin", Box::new(command::parsed_builtin(builtin))),
+        ("source", Box::new(command::raw_builtin(source))),
     ]
     .into_iter()
 }
@@ -102,7 +109,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 export: args.export,
             };
             ctx.set_var(name, scope.unwrap_or(VarScope::Function), var);
-            Ok(Status::SUCCESS)
+            Ok(ctx.last_status())
         }
     }
 }
@@ -246,4 +253,28 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
     }
 
     todo!();
+}
+
+pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<UnchangedStatus> {
+    let Some((path, args)) = args[1..].split_first() else {
+        return Err(Error::Custom("TODO: source from stdin".into()));
+    };
+
+    let source = {
+        let src = tokio::fs::read_to_string(path)
+            .await
+            .map_err(Error::ReadWrite)?;
+        parse_source(&src).map_err(|errs| Error::Custom(errs[0].to_string()))?
+    };
+
+    // TODO: Local scope.
+    let mut subctx = ExecContext::new_inside(ctx);
+    subctx.set_var("argv", VarScope::Function, args.to_vec());
+    match subctx.exec_source(&source).await {
+        ControlFlow::Continue(()) => {}
+        ControlFlow::Break(ExecBreak::FuncReturn(n)) => ctx.set_last_status(n),
+        _ => unreachable!(),
+    }
+
+    ExecResult::Ok(UnchangedStatus)
 }

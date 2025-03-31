@@ -31,7 +31,8 @@ pub trait Command: fmt::Debug + dyn_clone::DynClone + 'static {
 
 dyn_clone::clone_trait_object!(Command);
 
-pub(crate) trait ReportResult {
+#[expect(async_fn_in_trait, reason = "we accept !Send")]
+pub trait ReportResult {
     async fn report(self, ctx: &mut ExecContext<'_>) -> Status;
 }
 
@@ -71,18 +72,18 @@ impl<T: ReportResult, E: ReportResult> ReportResult for Result<T, E> {
     }
 }
 
-pub struct Builtin<F, Args, Ret> {
+struct RawBuiltin<F, Ret> {
     func: F,
-    _marker: PhantomData<fn(Args) -> Ret>,
+    _marker: PhantomData<fn() -> Ret>,
 }
 
-impl<F, Args, Ret> fmt::Debug for Builtin<F, Args, Ret> {
+impl<F, Ret> fmt::Debug for RawBuiltin<F, Ret> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Builtin").finish_non_exhaustive()
     }
 }
 
-impl<F: Clone, Args, Ret> Clone for Builtin<F, Args, Ret> {
+impl<F: Clone, Ret> Clone for RawBuiltin<F, Ret> {
     fn clone(&self) -> Self {
         Self {
             func: self.func.clone(),
@@ -91,7 +92,52 @@ impl<F: Clone, Args, Ret> Clone for Builtin<F, Args, Ret> {
     }
 }
 
-impl<F, Args, Ret> Command for Builtin<F, Args, Ret>
+impl<F, Ret> Command for RawBuiltin<F, Ret>
+where
+    F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String]) -> Ret,
+    Ret: 'static + ReportResult,
+{
+    fn exec<'fut>(
+        &'fut self,
+        ctx: &'fut mut ExecContext<'_>,
+        args: &'fut [String],
+    ) -> BoxFuture<'fut, Status> {
+        Box::pin(async move { (self.func)(ctx, args).await.report(ctx).await })
+    }
+}
+
+pub fn raw_builtin<F, Ret>(func: F) -> impl Command
+where
+    F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String]) -> Ret,
+    Ret: 'static + ReportResult,
+{
+    RawBuiltin {
+        func,
+        _marker: PhantomData,
+    }
+}
+
+struct ParsedBuiltin<F, Args, Ret> {
+    func: F,
+    _marker: PhantomData<fn(Args) -> Ret>,
+}
+
+impl<F, Args, Ret> fmt::Debug for ParsedBuiltin<F, Args, Ret> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builtin").finish_non_exhaustive()
+    }
+}
+
+impl<F: Clone, Args, Ret> Clone for ParsedBuiltin<F, Args, Ret> {
+    fn clone(&self) -> Self {
+        Self {
+            func: self.func.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<F, Args, Ret> Command for ParsedBuiltin<F, Args, Ret>
 where
     F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args) -> Ret,
     Args: 'static + clap::Parser,
@@ -112,17 +158,20 @@ where
     }
 }
 
-impl<F, Args, Ret> Builtin<F, Args, Ret> {
-    pub fn new(func: F) -> Self {
-        Self {
-            func,
-            _marker: PhantomData,
-        }
+pub fn parsed_builtin<F, Args, Ret>(func: F) -> impl Command
+where
+    F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args) -> Ret,
+    Args: 'static + clap::Parser,
+    Ret: 'static + ReportResult,
+{
+    ParsedBuiltin {
+        func,
+        _marker: PhantomData,
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct UserFunc(Rc<(Stmt, Option<String>)>);
+struct UserFunc(Rc<(Stmt, Option<String>)>);
 
 impl Command for UserFunc {
     fn exec<'fut>(
@@ -147,8 +196,6 @@ impl Command for UserFunc {
     }
 }
 
-impl UserFunc {
-    pub fn new(stmt: Stmt, description: Option<String>) -> Self {
-        Self(Rc::new((stmt, description)))
-    }
+pub fn user_func(stmt: Stmt, description: Option<String>) -> impl Command {
+    UserFunc(Rc::new((stmt, description)))
 }

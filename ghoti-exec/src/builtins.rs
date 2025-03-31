@@ -10,7 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::command::{BoxCommand, Builtin};
 use crate::utils::validate_variable_name;
-use crate::{Error, ExecContext, ExecResult, ExitStatus, Stdio, StdioCollectSink, VarScope};
+use crate::{
+    Error, ExecContext, ExecResult, ExitStatus, Stdio, StdioCollectSink, VarScope, Variable,
+};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand)> {
     [
@@ -47,6 +49,9 @@ pub struct SetArgs {
     #[argh(switch, short = 'u')]
     universal: bool,
 
+    #[argh(switch, short = 'x')]
+    export: bool,
+
     #[argh(positional, greedy)]
     args: Vec<String>,
 }
@@ -58,23 +63,29 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
         .sum::<u8>();
     ensure!(scope_flag_cnt <= 1, "scope flags are mutually exclusive");
     let scope = if args.local {
-        VarScope::Local
+        Some(VarScope::Local)
+    } else if args.function {
+        Some(VarScope::Function)
     } else if args.global {
-        VarScope::Global
+        Some(VarScope::Global)
     } else if args.universal {
-        VarScope::Universal
+        Some(VarScope::Universal)
     } else {
-        VarScope::Function
+        None
     };
 
     match args.args.split_first() {
         None => {
             let mut buf = String::new();
-            ctx.list_vars::<()>(scope, |name, vals| {
+            ctx.list_vars::<()>(scope, |name, var| {
+                if args.export && !var.export {
+                    return ControlFlow::Continue(());
+                }
+
                 buf.push_str(name);
-                if !vals.is_empty() {
+                if !var.value.is_empty() {
                     buf.push(' ');
-                    for (idx, val) in vals.iter().enumerate() {
+                    for (idx, val) in var.value.iter().enumerate() {
                         if idx != 0 {
                             buf.push_str("  ");
                         }
@@ -88,7 +99,11 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
         }
         Some((name, vals)) => {
             validate_variable_name(name)?;
-            ctx.set_var(name, scope, vals);
+            let var = Variable {
+                value: vals.to_vec(),
+                export: args.export,
+            };
+            ctx.set_var(name, scope.unwrap_or(VarScope::Function), var);
             Ok(ExitStatus::SUCCESS)
         }
     }
@@ -180,14 +195,25 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
     let (os_stdin, _) = cvt_stdio(&io.stdin, true)?;
     let (os_stdout, stdout_sink) = cvt_stdio(&io.stdout, false)?;
     let (os_stderr, stderr_sink) = cvt_stdio(&io.stderr, false)?;
-    let mut child = tokio::process::Command::new(cmd)
-        .kill_on_drop(true)
-        .args(args)
-        .stdin(os_stdin)
-        .stdout(os_stdout)
-        .stderr(os_stderr)
-        .spawn()
-        .map_err(|err| Error::SpawnProcess(cmd.into(), err))?;
+    let mut child = {
+        let mut builder = tokio::process::Command::new(cmd);
+        builder
+            .kill_on_drop(true)
+            .args(args)
+            .stdin(os_stdin)
+            .stdout(os_stdout)
+            .stderr(os_stderr)
+            .env_clear();
+        ctx.list_vars::<()>(None, |name, var| {
+            if var.export {
+                builder.env(name, var.value.join(" "));
+            }
+            ControlFlow::Continue(())
+        });
+        builder
+            .spawn()
+            .map_err(|err| Error::SpawnProcess(cmd.into(), err))?
+    };
 
     let mut copy_stdout = Either::Left(ready(ExecResult::Ok(ExitStatus::SUCCESS)));
     let mut copy_stderr = Either::Left(ready(ExecResult::Ok(ExitStatus::SUCCESS)));

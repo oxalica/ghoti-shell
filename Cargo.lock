@@ -280,7 +280,6 @@ name = "ghoti-exec"
 version = "0.1.0"
 dependencies = [
  "argh",
- "bitflags",
  "dyn-clone",
  "either",
  "ghoti-syntax",

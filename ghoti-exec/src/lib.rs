@@ -68,6 +68,8 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(std::io::Error),
 
+    #[error("invalid UTF8 in {0}")]
+    InvalidUtf8(String),
     #[error("invalid options: {0}")]
     InvalidOptions(String),
     #[error("invalid identifier: {0:?}")]
@@ -151,20 +153,6 @@ impl Io {
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct VarOpt: u8 {
-        const LOCAL     = 0b00;
-        const FUNCTION  = 0b01;
-        const GLOBAL    = 0b10;
-        const UNIVERSAL = 0b11;
-
-        const SCOPES    = 0b11;
-
-        const EXPORT = 0b100;
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum VarScope {
     Local,
@@ -174,29 +162,47 @@ pub enum VarScope {
     Universal,
 }
 
-impl From<VarScope> for VarOpt {
-    fn from(scope: VarScope) -> Self {
-        VarOpt::from_bits(scope as u8).expect("always valid")
+#[derive(Debug)]
+pub struct Variable {
+    pub value: ValueList,
+    pub export: bool,
+}
+
+impl Variable {
+    pub fn new(val: impl Into<String>) -> Self {
+        Self::new_list(Some(val.into()))
+    }
+
+    pub fn new_list(vals: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            value: vals.into_iter().collect(),
+            export: false,
+        }
+    }
+
+    pub fn exported(mut self) -> Self {
+        self.export = true;
+        self
     }
 }
 
-impl VarOpt {
-    pub fn scope(self) -> VarScope {
-        match self & Self::SCOPES {
-            Self::LOCAL => VarScope::Local,
-            Self::FUNCTION => VarScope::Function,
-            Self::GLOBAL => VarScope::Global,
-            Self::UNIVERSAL => VarScope::Universal,
-            _ => unreachable!(),
-        }
+impl From<String> for Variable {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<Vec<String>> for Variable {
+    fn from(vals: Vec<String>) -> Self {
+        Self::new_list(vals)
     }
 }
 
 #[derive(Debug)]
 pub struct Executor {
     builtin_funcs: BTreeMap<String, Box<dyn Command>>,
-    funcs: RefCell<BTreeMap<String, Box<dyn Command>>>,
-    vars: RefCell<BTreeMap<String, ValueList>>,
+    global_funcs: RefCell<BTreeMap<String, Box<dyn Command>>>,
+    global_vars: RefCell<BTreeMap<String, Variable>>,
 }
 
 impl Default for Executor {
@@ -212,8 +218,21 @@ impl Executor {
     pub fn new() -> Self {
         Self {
             builtin_funcs: BTreeMap::new(),
-            funcs: RefCell::new(BTreeMap::new()),
-            vars: RefCell::new(BTreeMap::new()),
+            global_funcs: RefCell::new(BTreeMap::new()),
+            global_vars: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn default_from_env() -> Self {
+        let mut this = Self::default();
+        this.import_from_env();
+        this
+    }
+
+    pub fn import_from_env(&mut self) {
+        // TODO: Non-UTF8
+        for (name, value) in std::env::vars() {
+            self.set_global_var(name, Variable::new(value).exported());
         }
     }
 
@@ -230,47 +249,41 @@ impl Executor {
     }
 
     pub(crate) fn global_funcs(&self) -> Ref<'_, BTreeMap<String, BoxCommand>> {
-        self.funcs.borrow()
+        self.global_funcs.borrow()
     }
 
     pub fn get_global_func(&self, name: &str) -> Option<BoxCommand> {
-        self.funcs.borrow().get(name).cloned()
+        self.global_funcs.borrow().get(name).cloned()
     }
 
     pub fn set_global_func(&self, name: String, cmd: impl Command) {
-        self.funcs.borrow_mut().insert(name, Box::new(cmd));
+        self.global_funcs.borrow_mut().insert(name, Box::new(cmd));
     }
 
     pub fn remove_global_func(&self, name: &str) {
-        self.funcs.borrow_mut().remove(name);
+        self.global_funcs.borrow_mut().remove(name);
     }
 
-    pub fn list_global_vars<B>(
-        &self,
-        mut f: impl FnMut(&str, &ValueList) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        for (name, vals) in self.vars.borrow().iter() {
-            f(name, vals)?;
-        }
-        ControlFlow::Continue(())
+    pub(crate) fn global_vars(&self) -> Ref<'_, BTreeMap<String, Variable>> {
+        self.global_vars.borrow()
     }
 
-    pub fn get_global_var(&self, name: &str) -> Option<impl Deref<Target = ValueList>> {
-        Ref::filter_map(self.vars.borrow(), |m| m.get(name)).ok()
+    pub fn get_global_var(&self, name: &str) -> Option<impl Deref<Target = Variable>> {
+        Ref::filter_map(self.global_vars.borrow(), |m| m.get(name)).ok()
     }
 
-    pub fn set_global_var(&self, name: String, vals: ValueList) {
-        self.vars.borrow_mut().insert(name, vals);
+    pub fn set_global_var(&self, name: String, var: Variable) {
+        self.global_vars.borrow_mut().insert(name, var);
     }
 
     pub fn remove_global_var(&self, name: &str) {
-        self.vars.borrow_mut().remove(name);
+        self.global_vars.borrow_mut().remove(name);
     }
 }
 
 #[derive(Debug)]
 pub struct ExecContext<'a> {
-    func_vars: BTreeMap<String, ValueList>,
+    func_vars: BTreeMap<String, Variable>,
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
     last_status: ExitStatus,
@@ -347,46 +360,53 @@ impl<'a> ExecContext<'a> {
 
     pub fn list_vars<B>(
         &self,
-        scope: VarScope,
-        mut f: impl FnMut(&str, &ValueList) -> ControlFlow<B>,
+        scope: Option<VarScope>,
+        mut f: impl FnMut(&str, &Variable) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         match scope {
-            VarScope::Local => todo!(),
-            VarScope::Function => {
-                for (name, vals) in &self.func_vars {
-                    f(name, vals)?;
+            Some(VarScope::Local) => todo!(),
+            Some(VarScope::Function) => {
+                for (name, var) in &self.func_vars {
+                    f(name, var)?;
                 }
-                ControlFlow::Continue(())
             }
-            VarScope::Global => self.list_global_vars(f),
-            VarScope::Universal => todo!(),
+            Some(VarScope::Global) => {
+                for (name, var) in self.global_vars().iter() {
+                    f(name, var)?;
+                }
+            }
+            Some(VarScope::Universal) => todo!(),
+            None => {
+                for (name, var) in itertools::merge_join_by(
+                    self.func_vars.iter(),
+                    self.global_vars().iter(),
+                    |lhs, rhs| lhs.0.cmp(rhs.0),
+                )
+                .map(|kv| kv.into_left())
+                {
+                    f(name, var)?;
+                }
+            }
         }
+        ControlFlow::Continue(())
     }
 
-    pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = ValueList>> {
+    pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = Variable>> {
         match self.func_vars.get(name) {
             Some(vals) => Some(Either::Left(vals)),
             None => self.get_global_var(name).map(Either::Right),
         }
     }
 
-    pub fn set_var(
-        &mut self,
-        name: impl Into<String>,
-        opt: impl Into<VarOpt>,
-        vals: impl Into<ValueList>,
-    ) {
-        let (name, opt, vals) = (name.into(), opt.into(), vals.into());
-        if opt.contains(VarOpt::EXPORT) {
-            todo!();
-        }
-        match opt.scope() {
+    pub fn set_var(&mut self, name: impl Into<String>, scope: VarScope, var: impl Into<Variable>) {
+        let (name, var) = (name.into(), var.into());
+        match scope {
             VarScope::Local => todo!(),
             VarScope::Function => {
-                self.func_vars.insert(name, vals);
+                self.func_vars.insert(name, var);
             }
             VarScope::Global => {
-                self.set_global_var(name, vals);
+                self.set_global_var(name, var);
             }
             VarScope::Universal => todo!(),
         }
@@ -460,7 +480,7 @@ impl<'a> ExecContext<'a> {
                 let var = validate_variable_words(&var)?;
                 let elems = self.expand_words(elem_ws).await?;
                 for elem in elems {
-                    self.set_var(var, VarScope::default(), [elem]);
+                    self.set_var(var, VarScope::default(), elem);
                     self.exec_stmt(body).await?;
                 }
                 Ok(self.last_status())
@@ -634,11 +654,12 @@ impl<'a> ExecContext<'a> {
                 match frag {
                     WordFrag::Literal(_) => {}
                     WordFrag::Variable(var) | WordFrag::VariableNoSplit(var) => {
-                        let vals = self
+                        let var = self
                             .get_var(var)
                             .ok_or_else(|| Error::VariableNotFound(var.into()))?;
+                        let vals = &var.value;
                         if matches!(frag, WordFrag::Variable(_)) {
-                            expanded.push(vals.to_vec());
+                            expanded.push(vals.clone());
                         } else {
                             expanded.push(vec![vals.join(" ")]);
                         }

@@ -432,12 +432,12 @@ impl<'a> ExecContext<'a> {
 
     async fn exec_stmt_inner(&mut self, stmt: &Stmt) -> ExecResult {
         match stmt {
-            Stmt::Command(words) => {
+            Stmt::Command(_pos, words) => {
                 let words = self.expand_words(words).await?;
                 self.exec_command(&words).await
             }
-            Stmt::Block(stmts) => Box::pin(self.exec_stmts(stmts)).await,
-            Stmt::If(cond, then, else_) => {
+            Stmt::Block(_pos, stmts) => Box::pin(self.exec_stmts(stmts)).await,
+            Stmt::If(_pos, cond, then, else_) => {
                 self.exec_stmt(cond).await?;
                 if self.last_status().is_success() {
                     self.exec_stmt(then).await
@@ -447,15 +447,15 @@ impl<'a> ExecContext<'a> {
                     Ok(ExitStatus::SUCCESS)
                 }
             }
-            Stmt::Switch(_, _) => todo!(),
-            Stmt::While(cond, body) => loop {
+            Stmt::Switch(..) => todo!(),
+            Stmt::While(_pos, cond, body) => loop {
                 self.exec_stmt(cond).await?;
                 if !self.last_status().is_success() {
                     break Ok(self.last_status());
                 }
                 self.exec_stmt(body).await?;
             },
-            Stmt::For(var, elem_ws, body) => {
+            Stmt::For(_pos, var, elem_ws, body) => {
                 let var = self.expand_words(slice::from_ref(var)).await?;
                 let var = validate_variable_words(&var)?;
                 let elems = self.expand_words(elem_ws).await?;
@@ -465,9 +465,9 @@ impl<'a> ExecContext<'a> {
                 }
                 Ok(self.last_status())
             }
-            Stmt::Break => todo!(),
-            Stmt::Continue => todo!(),
-            Stmt::Function(words, stmt) => {
+            Stmt::Break(_pos) => todo!(),
+            Stmt::Continue(_pos) => todo!(),
+            Stmt::Function(_pos, words, stmt) => {
                 let words = &*self.expand_words(words).await?;
                 let name = words.first().ok_or(Error::InvalidateIdentifierWords(0))?;
                 validate_function_name(name)?;
@@ -480,8 +480,8 @@ impl<'a> ExecContext<'a> {
                 self.set_global_func(name.into(), user_func);
                 Ok(ExitStatus::SUCCESS)
             }
-            Stmt::Return(_) => todo!(),
-            Stmt::Redirect(stmt, redirects) => {
+            Stmt::Return(..) => todo!(),
+            Stmt::Redirect(_pos, stmt, redirects) => {
                 let prev_io = self.io().clone();
                 let mut this = scopeguard::guard(&mut *self, |this| this.io = prev_io);
 
@@ -519,7 +519,7 @@ impl<'a> ExecContext<'a> {
 
                 this.exec_stmt(stmt).await
             }
-            Stmt::Pipe(port, lhs, rhs) => {
+            Stmt::Pipe(_pos, port, lhs, rhs) => {
                 let (pipe_r, pipe_w) = os_pipe::pipe().map_err(Error::CreatePipe)?;
                 let pipe_r = Stdio::Raw(Rc::new(pipe_r.into()));
                 let pipe_w = Stdio::Raw(Rc::new(pipe_w.into()));
@@ -544,18 +544,18 @@ impl<'a> ExecContext<'a> {
                 ret1?;
                 ret2
             }
-            Stmt::Not(stmt) => {
+            Stmt::Not(_pos, stmt) => {
                 let n = self.exec_stmt(stmt).await?;
                 Ok((!n.is_success()).into())
             }
-            Stmt::And(stmt) => {
+            Stmt::And(_pos, stmt) => {
                 if self.last_status.is_success() {
                     self.exec_stmt(stmt).await
                 } else {
                     Ok(self.last_status)
                 }
             }
-            Stmt::Or(stmt) => {
+            Stmt::Or(_pos, stmt) => {
                 if self.last_status.is_success() {
                     Ok(self.last_status)
                 } else {

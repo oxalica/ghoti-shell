@@ -71,32 +71,30 @@ StmtList: Vec<Stmt> = {
 EOS: () = { NEWLINE, ";" };
 
 Stmt: Stmt = {
-    <StmtNoCond>,
-
-    "and" <Stmt> => Stmt::And(<>.into()),
-    "or" <Stmt> => Stmt::Or(<>.into()),
-}
-
-StmtNoCond: Stmt = {
     #[precedence(level = "0")]
     <Control> => <>,
     #[precedence(level = "0")]
-    <Word+> => Stmt::Command(<>),
+    <pos:@L> <ws:Word+> => Stmt::Command(pos as _, ws),
 
     #[precedence(level = "1")]
-    <mut s:StmtNoCond> <r:Redirect> => {
+    <pos:@L> <mut s:Stmt> <r:Redirect> => {
         match &mut s {
-            Stmt::Redirect(_, rs) => { rs.push(r); s },
-            _ => Stmt::Redirect(s.into(), vec![r]),
+            Stmt::Redirect(_, _, rs) => { rs.push(r); s },
+            _ => Stmt::Redirect(pos as _, s.into(), vec![r]),
         }
     },
 
     #[precedence(level = "2")]
     #[assoc(side = "right")]
-    <lhs:StmtNoCond> <port:PipeOp> <rhs:StmtNoCond> => Stmt::Pipe(port, lhs.into(), rhs.into()),
+    <lhs:Stmt> <pos:@L> <port:PipeOp> <rhs:Stmt> => Stmt::Pipe(pos as _, port, lhs.into(), rhs.into()),
 
     #[precedence(level = "3")]
-    "not" <StmtNoCond> => Stmt::Not(<>.into()),
+    <pos:@L> "not" <s:Stmt> => Stmt::Not(pos as _, s.into()),
+
+    #[precedence(level = "3")]
+    <pos:@L> "and" <s:Stmt> => Stmt::And(pos as _, s.into()),
+    #[precedence(level = "3")]
+    <pos:@L> "or" <s:Stmt> => Stmt::Or(pos as _, s.into()),
 };
 
 PipeOp: RedirectPort = {
@@ -136,27 +134,27 @@ RedirectMode: RedirectMode = {
 };
 
 StmtBlock: Stmt =
-    <StmtList> => Stmt::Block(<>);
+    <pos:@L> <ls:StmtList> => Stmt::Block(pos as _, ls);
 
 Control: Stmt = {
-    "begin" EOS <StmtBlock> "end",
+    <pos:@L> "begin" EOS <ls:StmtList> "end" => Stmt::Block(pos as _, ls),
     <If> => <>,
-    "for" <var:Word> "in" <seq:Word*> EOS <body:StmtBlock> "end" => Stmt::For(var, seq, body.into()),
-    "while" <cond:Stmt> EOS <body:StmtBlock> "end" => Stmt::While(cond.into(), body.into()),
-    "break" => Stmt::Break,
-    "continue" => Stmt::Continue,
-    "function" <def:Word*> EOS <body:StmtBlock> "end" => Stmt::Function(def, body.into()),
-    "return" <Word?> => Stmt::Return(<>),
-    "switch" <testee:Word> EOS <cases:SwitchCase*> "end" => Stmt::Switch(testee, cases),
+    <pos:@L> "for" <var:Word> "in" <seq:Word*> EOS <body:StmtBlock> "end" => Stmt::For(pos as _, var, seq, body.into()),
+    <pos:@L> "while" <cond:Stmt> EOS <body:StmtBlock> "end" => Stmt::While(pos as _, cond.into(), body.into()),
+    <pos:@L> "break" => Stmt::Break(pos as _),
+    <pos:@L> "continue" => Stmt::Continue(pos as _),
+    <pos:@L> "function" <def:Word*> EOS <body:StmtBlock> "end" => Stmt::Function(pos as _, def, body.into()),
+    <pos:@L> "return" <w:Word?> => Stmt::Return(pos as _, w),
+    <pos:@L> "switch" <testee:Word> EOS <cases:SwitchCase*> "end" => Stmt::Switch(pos as _, testee, cases),
 };
 
 If: Stmt = {
-    "if" <cond:Stmt> EOS <then:StmtBlock> "end" =>
-        Stmt::If(cond.into(), then.into(), None),
-    "if" <cond:Stmt> EOS <then:StmtBlock> "else" <else_:If> "end" =>
-        Stmt::If(cond.into(), then.into(), Some(else_.into())),
-    "if" <cond:Stmt> EOS <then:StmtBlock> "else" EOS <else_:StmtBlock> "end" =>
-        Stmt::If(cond.into(), then.into(), Some(else_.into())),
+    <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "end" =>
+        Stmt::If(pos as _, cond.into(), then.into(), None),
+    <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "else" <else_:If> "end" =>
+        Stmt::If(pos as _, cond.into(), then.into(), Some(else_.into())),
+    <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "else" EOS <else_:StmtBlock> "end" =>
+        Stmt::If(pos as _, cond.into(), then.into(), Some(else_.into())),
 };
 
 SwitchCase: SwitchCase =

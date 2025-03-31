@@ -23,11 +23,11 @@ fn hoist_and_or() {
     println!("{ast:?}");
     assert!(matches!(
         &ast.stmts[0],
-        Stmt::If(cond, _, _)
+        Stmt::If(_, cond, _, _)
         if matches!(
             &**cond,
-            Stmt::Block(b)
-            if matches!(b[1], Stmt::And(_))
+            Stmt::Block(_, b)
+            if matches!(b[1], Stmt::And(..))
         )
     ));
 
@@ -40,13 +40,13 @@ fn hoist_and_or() {
     println!("{ast:?}");
     assert!(matches!(
         &ast.stmts[0],
-        Stmt::While(cond, body)
+        Stmt::While(_, cond, body)
         if matches!(
             &**cond,
-            Stmt::Block(b)
-            if matches!(b[1], Stmt::Or(_))
+            Stmt::Block(_, b)
+            if matches!(b[1], Stmt::Or(..))
         )
-        && matches!(&**body, Stmt::Block(b) if b.is_empty())
+        && matches!(&**body, Stmt::Block(_, b) if b.is_empty())
     ));
 }
 

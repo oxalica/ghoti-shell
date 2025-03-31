@@ -16,6 +16,8 @@ pub const KEYWORDS: &[&str] = &[
     "begin", "end", "if", "else", "switch", "case", "for", "in", "and", "or", "not", "function",
 ];
 
+pub type Pos = u32;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFile {
     pub stmts: Vec<Stmt>,
@@ -23,23 +25,45 @@ pub struct SourceFile {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Command(Words),
-    Block(Vec<Stmt>),
-    If(Box<Stmt>, Box<Stmt>, Option<Box<Stmt>>),
-    For(Word, Words, Box<Stmt>),
-    While(Box<Stmt>, Box<Stmt>),
-    Break,
-    Continue,
-    Function(Words, Box<Stmt>),
-    Return(Option<Word>),
-    Switch(Word, Vec<SwitchCase>),
+    Command(Pos, Words),
+    Block(Pos, Vec<Stmt>),
+    If(Pos, Box<Stmt>, Box<Stmt>, Option<Box<Stmt>>),
+    For(Pos, Word, Words, Box<Stmt>),
+    While(Pos, Box<Stmt>, Box<Stmt>),
+    Break(Pos),
+    Continue(Pos),
+    Function(Pos, Words, Box<Stmt>),
+    Return(Pos, Option<Word>),
+    Switch(Pos, Word, Vec<SwitchCase>),
 
-    Redirect(Box<Stmt>, Vec<Redirect>),
-    Pipe(RedirectPort, Box<Stmt>, Box<Stmt>),
+    Redirect(Pos, Box<Stmt>, Vec<Redirect>),
+    Pipe(Pos, RedirectPort, Box<Stmt>, Box<Stmt>),
 
-    Not(Box<Stmt>),
-    And(Box<Stmt>),
-    Or(Box<Stmt>),
+    Not(Pos, Box<Stmt>),
+    And(Pos, Box<Stmt>),
+    Or(Pos, Box<Stmt>),
+}
+
+impl Stmt {
+    pub fn pos(&self) -> u32 {
+        match self {
+            Stmt::Command(pos, ..)
+            | Stmt::Block(pos, ..)
+            | Stmt::If(pos, ..)
+            | Stmt::For(pos, ..)
+            | Stmt::While(pos, ..)
+            | Stmt::Break(pos, ..)
+            | Stmt::Continue(pos, ..)
+            | Stmt::Function(pos, ..)
+            | Stmt::Return(pos, ..)
+            | Stmt::Switch(pos, ..)
+            | Stmt::Redirect(pos, ..)
+            | Stmt::Pipe(pos, ..)
+            | Stmt::Not(pos, ..)
+            | Stmt::And(pos, ..)
+            | Stmt::Or(pos, ..) => *pos,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

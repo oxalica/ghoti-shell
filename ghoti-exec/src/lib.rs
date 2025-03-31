@@ -71,7 +71,7 @@ pub enum Error {
     #[error("invalid UTF8 in {0}")]
     InvalidUtf8(String),
     #[error("invalid options: {0}")]
-    InvalidOptions(String),
+    InvalidOptions(clap::Error),
     #[error("invalid identifier: {0:?}")]
     InvalidateIdentifier(String),
     #[error("expecting an identifier, found a list with {0} elements")]
@@ -491,10 +491,9 @@ impl<'a> ExecContext<'a> {
                 let words = &*self.expand_words(words).await?;
                 let name = words.first().ok_or(Error::InvalidateIdentifierWords(0))?;
                 validate_function_name(name)?;
-                let strs = words[1..].iter().map(|s| s.as_str()).collect::<Vec<_>>();
-                let desc = match <FunctionOpts as argh::FromArgs>::from_args(&[name], &strs) {
+                let desc = match <FunctionOpts as clap::Parser>::try_parse_from(words) {
                     Ok(opts) => opts.description,
-                    Err(err) => return Err(Error::InvalidOptions(err.output)),
+                    Err(err) => return Err(Error::InvalidOptions(err)),
                 };
                 let user_func = UserFunc::new((**stmt).clone(), desc);
                 self.set_global_func(name.into(), user_func);

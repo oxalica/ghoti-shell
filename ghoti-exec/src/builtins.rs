@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 use std::process;
 use std::rc::Rc;
 
-use argh::FromArgs;
+use clap::Parser;
 use either::Either;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
@@ -31,32 +31,33 @@ macro_rules! ensure {
     };
 }
 
-#[derive(Debug, FromArgs)]
+#[derive(Debug, Parser)]
 pub(crate) struct FunctionOpts {
-    #[argh(option, short = 'd')]
+    #[arg(long, short)]
     pub description: Option<String>,
 }
 
 // TODO
-#[derive(Debug, FromArgs)]
+#[derive(Debug, Parser)]
 pub struct SetArgs {
-    #[argh(switch, short = 'l')]
+    #[arg(long, short)]
     local: bool,
-    #[argh(switch, short = 'f')]
+    #[arg(long, short)]
     function: bool,
-    #[argh(switch, short = 'g')]
+    #[arg(long, short)]
     global: bool,
-    #[argh(switch, short = 'u')]
+    #[arg(long, short)]
     universal: bool,
 
-    #[argh(switch, short = 'x')]
+    #[arg(long, short = 'x')]
     export: bool,
 
-    #[argh(positional, greedy)]
+    #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
 pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
+    dbg!(&args);
     let scope_flag_cnt = [args.local, args.function, args.global, args.universal]
         .iter()
         .map(|&b| b as u8)
@@ -109,14 +110,14 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
     }
 }
 
-#[derive(Debug, FromArgs)]
+#[derive(Debug, Parser)]
 pub struct BuiltinArgs {
-    #[argh(switch, short = 'n')]
+    #[arg(long, short)]
     names: bool,
-    #[argh(switch, short = 'q')]
+    #[arg(long, short)]
     query: bool,
 
-    #[argh(positional, greedy)]
+    #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
@@ -143,16 +144,16 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult
     }
 }
 
-#[derive(Debug, FromArgs)]
+#[derive(Debug, Parser)]
 pub struct CommandArgs {
-    #[argh(switch, short = 'a')]
+    #[arg(long, short)]
     pub all: bool,
-    #[argh(switch, short = 'q')]
+    #[arg(long, short)]
     pub query: bool,
-    #[argh(switch, short = 's')]
+    #[arg(long, short)]
     pub search: bool,
 
-    #[argh(positional, greedy)]
+    #[arg(trailing_var_arg = true)]
     pub args: Vec<String>,
 }
 

@@ -53,17 +53,16 @@ impl<F: Clone, Args> Clone for Builtin<F, Args> {
 impl<F, Args> Command for Builtin<F, Args>
 where
     F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args) -> ExecResult,
-    Args: 'static + argh::FromArgs,
+    Args: 'static + clap::Parser,
 {
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
     ) -> BoxFuture<'fut, ExecResult> {
-        let strs = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-        match <Args as argh::FromArgs>::from_args(&[strs[0]], &strs[1..]) {
+        match <Args as clap::Parser>::try_parse_from(args) {
             Ok(parsed) => Box::pin((self.func)(ctx, parsed)),
-            Err(err) => Box::pin(std::future::ready(Err(Error::InvalidOptions(err.output)))),
+            Err(err) => Box::pin(std::future::ready(Err(Error::InvalidOptions(err)))),
         }
     }
 }

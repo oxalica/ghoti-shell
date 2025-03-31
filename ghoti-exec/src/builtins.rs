@@ -76,6 +76,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs, io: Io) -> ExecResult
                         write!(buf, "\"{}\"", val.escape_debug()).unwrap();
                     }
                 }
+                buf.push('\n');
                 ControlFlow::Continue(())
             });
             io.write_stdout(buf)

@@ -153,7 +153,7 @@ define_visitor! {
             WordFrag::Literal(_) |
             WordFrag::Variable(_) |
             WordFrag::VariableNoSplit(_) |
-            WordFrag::TildeSegment |
+            WordFrag::Home { .. } |
             WordFrag::Wildcard |
             WordFrag::WildcardRecursive => {}
             WordFrag::Command(s) |

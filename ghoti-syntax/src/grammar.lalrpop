@@ -54,6 +54,7 @@ extern {
         "*" => Token::Star,
         "**" => Token::StarStar,
         "~" => Token::Tilde,
+        "~/" => Token::TildeSlash,
         "\"" => Token::DQuote,
         "'" => Token::SQuote,
     }
@@ -110,7 +111,7 @@ PipeOp: RedirectPort = {
 }
 
 Redirect: Redirect = {
-    <port:("&" NOSP <@L> <Word> NOSP <@R>)?> <mode:RedirectMode> NOSP <dest:Word> =>? {
+    <port:("&" NOSP <@L> <WordJoined> NOSP <@R>)?> <mode:RedirectMode> NOSP <dest:Word> =>? {
         let port = match port {
             None => mode.default_port(),
             Some((lpos, port, rpos)) => {
@@ -161,10 +162,15 @@ SwitchCase: SwitchCase =
     "case" <globs:Word*> EOS <body:StmtBlock> => SwitchCase { globs, body };
 
 Word: Word = {
+    "~" => Word::Complex(vec![WordFrag::Home { slash: false }]),
+    <WordJoined>,
+};
+
+WordJoined: Word = {
     <WordFrag> => Word::from(<>),
     <String> => Word::Complex(<>),
-    <w:Word> NOSP <frag:WordFrag> => w.append(frag),
-    <w:Word> NOSP <frags:String> => {
+    <w:WordJoined> NOSP <frag:WordFrag> => w.append(frag),
+    <w:WordJoined> NOSP <frags:String> => {
         let fs = match w {
             Word::Simple(w) => std::iter::once(WordFrag::Literal(w)).chain(frags).collect(),
             Word::Complex(mut fs) => { fs.extend(frags); fs },
@@ -174,13 +180,14 @@ Word: Word = {
 };
 
 WordFrag: WordFrag = {
-    // TODO: "~"
+    "~/" => WordFrag::Home { slash: true },
     <WORD> => WordFrag::Literal(<>.into()),
     <"$VAR"> => WordFrag::Variable(<>.into()),
     "*" => WordFrag::Wildcard,
     "**" => WordFrag::WildcardRecursive,
     "$(" <StmtBlock> ")" => WordFrag::Command(<>),
-    // "{"
+    "(" <StmtBlock> ")" => WordFrag::Command(<>),
+    // TODO: "{"
 };
 
 String: Vec<WordFrag> = {
@@ -189,7 +196,7 @@ String: Vec<WordFrag> = {
 };
 DQuoteFrag: WordFrag = {
     <"$VAR"> => WordFrag::VariableNoSplit(<>.into()),
-    // $(
+    "$(" <StmtBlock> ")" => WordFrag::CommandNoSplit(<>),
     <STRING_FRAGMENT> => WordFrag::Literal(<>.into()),
 };
 SQuoteFrag: WordFrag =

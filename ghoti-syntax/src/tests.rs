@@ -1,4 +1,4 @@
-use crate::{ParseErrorKind, Stmt, parse_source};
+use crate::{ParseErrorKind, Stmt, Word, WordFrag, parse_source};
 
 #[test]
 fn smoke() {
@@ -92,4 +92,24 @@ fn invalid_break_continue() {
         end
     ";
     parse_source(src).unwrap();
+}
+
+#[test]
+fn home() {
+    let src = "~ ~/a";
+    let ast = parse_source(src).unwrap();
+    dbg!(&ast);
+    assert!(matches!(
+        &ast.stmts[0],
+        Stmt::Command(_, ws)
+        if matches!(
+            &ws[..],
+            [Word::Complex(a), Word::Complex(b)]
+            if matches!(&a[..], [WordFrag::Home { slash: false }])
+            && matches!(&b[..], [WordFrag::Home { slash: true }, _])
+        )
+    ));
+
+    parse_source("echo ~a").unwrap_err();
+    parse_source("echo a~").unwrap_err();
 }

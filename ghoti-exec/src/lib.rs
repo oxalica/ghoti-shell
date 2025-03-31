@@ -23,6 +23,8 @@ pub mod builtins;
 pub mod command;
 mod utils;
 
+const HOME_VAR: &str = "HOME";
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type ExecResult<T = Status> = Result<T>;
@@ -686,8 +688,16 @@ impl<'a> ExecContext<'a> {
         self.set_last_status(st);
     }
 
-    // TODO: Word and size limit.
     async fn expand_words(&mut self, words: &[ast::Word]) -> Vec<String> {
+        let mut out = Vec::new();
+        for w in words {
+            self.expand_word_into(&mut out, w).await;
+        }
+        out
+    }
+
+    // TODO: Word and size limit.
+    async fn expand_word_into(&mut self, out: &mut Vec<String>, word: &ast::Word) {
         fn dfs(
             ret: &mut Vec<String>,
             stack: &mut String,
@@ -709,7 +719,8 @@ impl<'a> ExecContext<'a> {
                 | WordFrag::VariableNoSplit(_)
                 | WordFrag::Command(_)
                 | WordFrag::CommandNoSplit(_)
-                | WordFrag::Brace(_) => {
+                | WordFrag::Brace(_)
+                | WordFrag::Home { .. } => {
                     let (words, rest_computed) = expanded.split_first().unwrap();
                     for w in words {
                         stack.push_str(w);
@@ -717,94 +728,100 @@ impl<'a> ExecContext<'a> {
                         stack.truncate(prev_len);
                     }
                 }
-                WordFrag::TildeSegment | WordFrag::Wildcard | WordFrag::WildcardRecursive => {
+                WordFrag::Wildcard | WordFrag::WildcardRecursive => {
                     todo!()
                 }
             }
         }
 
-        let mut ret = Vec::new();
+        // Pre-expand.
+        let frags = match word {
+            ast::Word::Simple(w) => {
+                out.push(w.clone());
+                return;
+            }
+            ast::Word::Complex(frags) => frags,
+        };
 
-        for w in words {
-            let frags = match w {
-                ast::Word::Simple(w) => {
-                    ret.push(w.clone());
-                    continue;
+        let mut frag_expanded = Vec::with_capacity(frags.len());
+        for frag in frags {
+            match frag {
+                WordFrag::Literal(_) => {}
+                WordFrag::Variable(var_name) | WordFrag::VariableNoSplit(var_name) => {
+                    let var = self.get_var(var_name);
+                    let vals = match &var {
+                        Some(var) => &var.value[..],
+                        None => {
+                            drop(var);
+                            self.emit_error(Error::VariableNotFound(var_name.into()))
+                                .await;
+                            &[]
+                        }
+                    };
+                    if matches!(frag, WordFrag::Variable(_)) {
+                        frag_expanded.push(vals.to_vec());
+                    } else {
+                        frag_expanded.push(vec![vals.join(" ")]);
+                    }
                 }
-                ast::Word::Complex(frags) => frags,
-            };
+                WordFrag::Command(stmt) | WordFrag::CommandNoSplit(stmt) => {
+                    let buf = {
+                        let buf = Rc::new(RefCell::new(Vec::new()));
+                        let buf_weak = Rc::downgrade(&buf);
+                        // FIXME: Avoid double Rc?
+                        let io_collect = Stdio::Collect(Rc::new(move |bytes| {
+                            buf_weak
+                                .upgrade()
+                                .ok_or(Error::PipeClosed)?
+                                .borrow_mut()
+                                .extend_from_slice(bytes);
+                            Ok(Status::SUCCESS)
+                        }));
+                        let prev_stdout = std::mem::replace(&mut self.io.stdout, io_collect);
+                        let mut this =
+                            scopeguard::guard(&mut *self, move |this| this.io.stdout = prev_stdout);
+                        this.exec_stmt(stmt).await;
+                        Rc::into_inner(buf).unwrap().into_inner()
+                    };
+                    let mut buf = String::from_utf8(buf).expect("TODO");
 
-            let mut expanded = Vec::with_capacity(frags.len());
-            for frag in frags {
-                match frag {
-                    WordFrag::Literal(_) => {}
-                    WordFrag::Variable(var_name) | WordFrag::VariableNoSplit(var_name) => {
-                        let var = self.get_var(var_name);
-                        let vals = match &var {
-                            Some(var) => &var.value[..],
-                            None => {
-                                drop(var);
-                                self.emit_error(Error::VariableNotFound(var_name.into()))
-                                    .await;
-                                &[]
-                            }
-                        };
-                        if matches!(frag, WordFrag::Variable(_)) {
-                            expanded.push(vals.to_vec());
-                        } else {
-                            expanded.push(vec![vals.join(" ")]);
-                        }
+                    if let WordFrag::CommandNoSplit(_) = frag {
+                        let len = buf.trim_end_matches('\n').len();
+                        buf.truncate(len);
+                        frag_expanded.push(vec![buf]);
+                    } else {
+                        frag_expanded.push(buf.lines().map(|s| s.to_owned()).collect());
                     }
-                    WordFrag::Command(stmt) | WordFrag::CommandNoSplit(stmt) => {
-                        let buf = {
-                            let buf = Rc::new(RefCell::new(Vec::new()));
-                            let buf_weak = Rc::downgrade(&buf);
-                            // FIXME: Avoid double Rc?
-                            let io_collect = Stdio::Collect(Rc::new(move |bytes| {
-                                buf_weak
-                                    .upgrade()
-                                    .ok_or(Error::PipeClosed)?
-                                    .borrow_mut()
-                                    .extend_from_slice(bytes);
-                                Ok(Status::SUCCESS)
-                            }));
-                            let prev_stdout = std::mem::replace(&mut self.io.stdout, io_collect);
-                            let mut this = scopeguard::guard(&mut *self, move |this| {
-                                this.io.stdout = prev_stdout
-                            });
-                            this.exec_stmt(stmt).await;
-                            Rc::into_inner(buf).unwrap().into_inner()
-                        };
-                        let mut buf = String::from_utf8(buf).expect("TODO");
-
-                        if let WordFrag::CommandNoSplit(_) = frag {
-                            let len = buf.trim_end_matches('\n').len();
-                            buf.truncate(len);
-                            expanded.push(vec![buf]);
-                        } else {
-                            expanded.push(buf.lines().map(|s| s.to_owned()).collect());
-                        }
+                }
+                WordFrag::Brace(words) => {
+                    let mut alts = Vec::with_capacity(words.len());
+                    for w in words {
+                        Box::pin(self.expand_word_into(&mut alts, w)).await;
                     }
-                    WordFrag::Brace(words) => {
-                        let mut alts = Vec::with_capacity(words.len());
-                        for w in words {
-                            let mut vals = Box::pin(self.expand_words(slice::from_ref(w))).await;
-                            if vals.len() != 1 {
-                                todo!();
-                            }
-                            alts.push(vals.pop().unwrap());
-                        }
-                        expanded.push(alts);
-                    }
-                    WordFrag::TildeSegment | WordFrag::Wildcard | WordFrag::WildcardRecursive => {
-                        todo!()
-                    }
+                    frag_expanded.push(alts);
+                }
+                WordFrag::Home { slash } => {
+                    frag_expanded.push(self.get_home(*slash).into_iter().collect());
+                }
+                WordFrag::Wildcard | WordFrag::WildcardRecursive => {
+                    todo!()
                 }
             }
-
-            dfs(&mut ret, &mut String::new(), frags, &expanded);
         }
 
-        ret
+        if frag_expanded.iter().all(|alts| !alts.is_empty()) {
+            dfs(out, &mut String::new(), frags, &frag_expanded);
+        }
+    }
+
+    fn get_home(&self, slash: bool) -> Option<String> {
+        let var = self.get_var(HOME_VAR)?;
+        let mut s = var.value.join(" ");
+        let pos = s.trim_end_matches('/').len();
+        s.truncate(pos);
+        if slash || s.is_empty() {
+            s.push('/');
+        }
+        Some(s)
     }
 }

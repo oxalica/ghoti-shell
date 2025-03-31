@@ -92,6 +92,8 @@ enum Token<'i> {
     StarStar,
     #[token("~")]
     Tilde,
+    #[token("~/")]
+    TildeSlash,
 
     // Words.
     #[regex(r"[\w%+,\-./=@^]+")]
@@ -124,7 +126,7 @@ enum Token<'i> {
 enum TokenDString<'i> {
     #[token("\"")]
     DQuote,
-    #[regex(r#"\$\w+"#)]
+    #[regex(r#"\$\w+"#, |lexer| &lexer.slice()[1..])]
     Variable(&'i str),
     #[token("$(")]
     DollarLParen,
@@ -179,6 +181,7 @@ fn lex(src: &str) -> Result<Vec<(usize, Token<'_>, usize)>> {
                 | Token::LtQus
                 | Token::Amp
                 | Token::Star
+                | Token::TildeSlash
                 | Token::Tilde
                 | Token::DollarLParen
                 | Token::LBrace
@@ -200,6 +203,7 @@ fn lex(src: &str) -> Result<Vec<(usize, Token<'_>, usize)>> {
                 | Token::LtQus
                 | Token::Amp
                 | Token::Star
+                | Token::TildeSlash
                 | Token::Tilde
                 | Token::RParen
                 | Token::RBrace

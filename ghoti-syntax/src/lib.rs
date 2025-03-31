@@ -182,7 +182,7 @@ pub enum WordFrag {
 
     Brace(Vec<Word>),
 
-    TildeSegment,
+    Home { slash: bool },
     Wildcard,
     WildcardRecursive,
 }

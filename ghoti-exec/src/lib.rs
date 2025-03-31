@@ -2,21 +2,22 @@ use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::marker::PhantomData;
 use std::ops::{ControlFlow, Deref};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::{fmt, slice};
 
+use builtins::FunctionOpts;
+use command::{BoxCommand, Command, UserFunc};
+use either::Either;
 use ghoti_syntax::{self as ast, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag};
 
-pub mod builtins;
-mod utils;
+use crate::utils::{validate_function_name, validate_variable_words};
 
-use either::Either;
-use utils::{validate_function_name, validate_variable_words};
+pub mod builtins;
+pub mod command;
+mod utils;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -67,6 +68,8 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(std::io::Error),
 
+    #[error("invalid options: {0}")]
+    InvalidOptions(String),
     #[error("invalid identifier: {0:?}")]
     InvalidateIdentifier(String),
     #[error("expecting an identifier, found a list with {0} elements")]
@@ -191,8 +194,8 @@ impl VarOpt {
 
 #[derive(Debug)]
 pub struct Executor {
-    builtin_funcs: BTreeMap<String, Command>,
-    funcs: RefCell<BTreeMap<String, Command>>,
+    builtin_funcs: BTreeMap<String, Box<dyn Command>>,
+    funcs: RefCell<BTreeMap<String, Box<dyn Command>>>,
     vars: RefCell<BTreeMap<String, ValueList>>,
 }
 
@@ -214,28 +217,28 @@ impl Executor {
         }
     }
 
-    pub fn builtins(&self) -> impl ExactSizeIterator<Item = (&str, &Command)> {
+    pub fn builtins(&self) -> impl ExactSizeIterator<Item = (&str, &BoxCommand)> {
         self.builtin_funcs.iter().map(|(name, cmd)| (&**name, cmd))
     }
 
-    pub fn set_builtin(&mut self, name: String, cmd: Command) {
-        self.builtin_funcs.insert(name, cmd);
+    pub fn set_builtin(&mut self, name: String, cmd: impl Command) {
+        self.builtin_funcs.insert(name, Box::new(cmd));
     }
 
-    pub fn get_builtin(&self, name: &str) -> Option<Command> {
+    pub fn get_builtin(&self, name: &str) -> Option<BoxCommand> {
         self.builtin_funcs.get(name).cloned()
     }
 
-    pub(crate) fn global_funcs(&self) -> Ref<'_, BTreeMap<String, Command>> {
+    pub(crate) fn global_funcs(&self) -> Ref<'_, BTreeMap<String, BoxCommand>> {
         self.funcs.borrow()
     }
 
-    pub fn get_global_func(&self, name: &str) -> Option<Command> {
+    pub fn get_global_func(&self, name: &str) -> Option<BoxCommand> {
         self.funcs.borrow().get(name).cloned()
     }
 
-    pub fn set_global_func(&self, name: String, cmd: Command) {
-        self.funcs.borrow_mut().insert(name, cmd);
+    pub fn set_global_func(&self, name: String, cmd: impl Command) {
+        self.funcs.borrow_mut().insert(name, Box::new(cmd));
     }
 
     pub fn remove_global_func(&self, name: &str) {
@@ -314,7 +317,7 @@ impl<'a> ExecContext<'a> {
 
     pub fn list_funcs<B>(
         &self,
-        mut f: impl FnMut(&str, &Command) -> ControlFlow<B>,
+        mut f: impl FnMut(&str, &BoxCommand) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         for (name, cmd) in itertools::merge_join_by(
             self.global_funcs()
@@ -330,7 +333,7 @@ impl<'a> ExecContext<'a> {
         ControlFlow::Continue(())
     }
 
-    pub fn get_func(&self, name: &str) -> Option<Command> {
+    pub fn get_func(&self, name: &str) -> Option<BoxCommand> {
         self.get_global_func(name)
             .or_else(|| self.get_builtin(name))
     }
@@ -459,12 +462,15 @@ impl<'a> ExecContext<'a> {
             Stmt::Continue => todo!(),
             Stmt::Function(words, stmt) => {
                 let words = &*self.expand_words(words).await?;
-                let [name] = words else {
-                    return Err(Error::InvalidateIdentifierWords(words.len()));
-                };
+                let name = words.first().ok_or(Error::InvalidateIdentifierWords(0))?;
                 validate_function_name(name)?;
-                let func_cmd = Command::new_function((**stmt).clone());
-                self.set_global_func(name.into(), func_cmd);
+                let strs = words[1..].iter().map(|s| s.as_str()).collect::<Vec<_>>();
+                let desc = match <FunctionOpts as argh::FromArgs>::from_args(&[name], &strs) {
+                    Ok(opts) => opts.description,
+                    Err(err) => return Err(Error::InvalidOptions(err.output)),
+                };
+                let user_func = UserFunc::new((**stmt).clone(), desc);
+                self.set_global_func(name.into(), user_func);
                 Ok(ExitStatus::SUCCESS)
             }
             Stmt::Return(_) => todo!(),
@@ -677,125 +683,5 @@ impl<'a> ExecContext<'a> {
         }
 
         Ok(ret)
-    }
-}
-
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
-
-pub trait DynCommand: 'static + dyn_clone::DynClone {
-    fn exec<'fut>(
-        &'fut self,
-        ctx: &'fut mut ExecContext<'_>,
-        args: &'fut [String],
-        io: Io,
-    ) -> BoxFuture<'fut, ExecResult>;
-}
-
-dyn_clone::clone_trait_object!(DynCommand);
-
-#[derive(Clone)]
-pub struct Command {
-    func: Box<dyn DynCommand>,
-}
-
-impl fmt::Debug for Command {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Command").finish_non_exhaustive()
-    }
-}
-
-impl Command {
-    pub const fn new(func: Box<dyn DynCommand>) -> Self {
-        Self { func }
-    }
-
-    pub fn new_native<F>(func: F) -> Self
-    where
-        F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String], Io) -> ExecResult,
-    {
-        #[derive(Clone)]
-        struct Native<F>(F);
-
-        impl<F> DynCommand for Native<F>
-        where
-            F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String], Io) -> ExecResult,
-        {
-            fn exec<'fut>(
-                &'fut self,
-                ctx: &'fut mut ExecContext<'_>,
-                args: &'fut [String],
-                io: Io,
-            ) -> BoxFuture<'fut, ExecResult> {
-                Box::pin(self.0(ctx, args, io))
-            }
-        }
-
-        Self::new(Box::new(Native(func)))
-    }
-
-    pub fn new_native_parsed<F, Args>(func: F) -> Self
-    where
-        F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args, Io) -> ExecResult,
-        Args: 'static + argh::FromArgs,
-    {
-        struct Native<F, Args>(F, PhantomData<fn(Args)>);
-
-        impl<F: Clone, Args> Clone for Native<F, Args> {
-            fn clone(&self) -> Self {
-                Self(self.0.clone(), PhantomData)
-            }
-        }
-
-        impl<F, Args> DynCommand for Native<F, Args>
-        where
-            F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, Args, Io) -> ExecResult,
-            Args: 'static + argh::FromArgs,
-        {
-            fn exec<'fut>(
-                &'fut self,
-                ctx: &'fut mut ExecContext<'_>,
-                args: &'fut [String],
-                io: Io,
-            ) -> BoxFuture<'fut, ExecResult> {
-                let strs = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-                match <Args as argh::FromArgs>::from_args(&[strs[0]], &strs[1..]) {
-                    Ok(parsed) => Box::pin((self.0)(ctx, parsed, io)),
-                    Err(_) => todo!(),
-                }
-            }
-        }
-
-        Self::new(Box::new(Native(func, PhantomData)))
-    }
-
-    pub fn new_function(stmt: Stmt) -> Self {
-        #[derive(Clone)]
-        struct Func(Rc<Stmt>);
-
-        impl DynCommand for Func {
-            fn exec<'fut>(
-                &'fut self,
-                ctx: &'fut mut ExecContext<'_>,
-                args: &'fut [String],
-                io: Io,
-            ) -> BoxFuture<'fut, ExecResult> {
-                Box::pin(async move {
-                    let mut subctx = ExecContext::new_inside(ctx);
-                    subctx.set_var("argv", VarScope::Function, args[1..].to_vec());
-                    subctx.exec_stmt(&self.0, io).await
-                })
-            }
-        }
-
-        Self::new(Box::new(Func(Rc::new(stmt))))
-    }
-
-    pub fn exec<'fut>(
-        &'fut self,
-        ctx: &'fut mut ExecContext<'_>,
-        args: &'fut [String],
-        io: Io,
-    ) -> impl Future<Output = ExecResult> + use<'fut> {
-        self.func.exec(ctx, args, io)
     }
 }

@@ -8,16 +8,15 @@ use argh::FromArgs;
 use either::Either;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
+use crate::command::{BoxCommand, Builtin};
 use crate::utils::validate_variable_name;
-use crate::{
-    Command, Error, ExecContext, ExecResult, ExitStatus, Io, Stdio, StdioCollectSink, VarScope,
-};
+use crate::{Error, ExecContext, ExecResult, ExitStatus, Io, Stdio, StdioCollectSink, VarScope};
 
-pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> {
+pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand)> {
     [
-        ("command", Command::new_native_parsed(command)),
-        ("set", Command::new_native_parsed(set)),
-        ("builtin", Command::new_native_parsed(builtin)),
+        ("command", Box::new(Builtin::new(command)) as BoxCommand),
+        ("set", Box::new(Builtin::new(set))),
+        ("builtin", Box::new(Builtin::new(builtin))),
     ]
     .into_iter()
 }
@@ -28,6 +27,12 @@ macro_rules! ensure {
             return Err(Error::Custom(format!($($msg)+)));
         }
     };
+}
+
+#[derive(Debug, FromArgs)]
+pub(crate) struct FunctionOpts {
+    #[argh(option, short = 'd')]
+    pub description: Option<String>,
 }
 
 // TODO

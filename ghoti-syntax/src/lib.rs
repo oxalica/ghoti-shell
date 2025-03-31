@@ -18,16 +18,26 @@ pub enum Stmt {
     Command(Words),
     Block(Vec<Stmt>),
     If(Box<Stmt>, Box<Stmt>, Option<Box<Stmt>>),
-    While(Box<Stmt>, Box<Stmt>),
     For(Word, Words, Box<Stmt>),
+    While(Box<Stmt>, Box<Stmt>),
+    Break,
+    Continue,
     Function(Words, Box<Stmt>),
+    Return(Option<Word>),
+    Switch(Word, Vec<SwitchCase>),
 
     Redirect(Box<Stmt>, Vec<Redirect>),
     Pipe(RedirectPort, Box<Stmt>, Box<Stmt>),
 
     Not(Box<Stmt>),
-    And(Box<Stmt>, Box<Stmt>),
-    Or(Box<Stmt>, Box<Stmt>),
+    And(Box<Stmt>),
+    Or(Box<Stmt>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    pub globs: Vec<Word>,
+    pub body: Stmt,
 }
 
 #[derive(Debug, Clone, PartialEq)]

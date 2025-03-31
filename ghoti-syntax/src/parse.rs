@@ -79,32 +79,39 @@ enum Token<'i> {
     Newline,
 
     // Keywords.
-    #[token("begin")]
-    Begin,
-    #[token("end")]
-    End,
     #[token("if")]
     If,
     #[token("else")]
     Else,
-    #[token("switch")]
-    Switch,
-    #[token("case")]
-    Case,
-    #[token("while")]
-    While,
     #[token("for")]
     For,
     #[token("in")]
     In,
-    #[token("; and")]
-    SemiAnd,
-    #[token("; or")]
-    SemiOr,
-    #[token("not")]
-    Not,
+    #[token("while")]
+    While,
+    #[token("break")]
+    Break,
+    #[token("continue")]
+    Continue,
     #[token("function")]
     Function,
+    #[token("return")]
+    Return,
+    #[token("begin")]
+    Begin,
+    #[token("end")]
+    End,
+    #[token("switch")]
+    Switch,
+    #[token("case")]
+    Case,
+    #[token("and")]
+    And,
+    #[token("or")]
+    Or,
+    #[token("not")]
+    Not,
+    // Implemented as builtins: command, builtin, time, exec.
 
     // Punctuations.
     #[token("(")]

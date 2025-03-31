@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use annotate_snippets::{Level, Renderer, Snippet};
-use ghoti_exec::{Error, ExecContext, Io};
+use ghoti_exec::{ExecContext, ExitStatus, Io};
 use ghoti_syntax::parse::parse_source;
 use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
@@ -67,13 +67,13 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
     let mut rl: Editor<ShellHelper, DefaultHistory> = rustyline::Editor::new()?;
     rl.set_helper(Some(ShellHelper { ctx }));
 
-    let mut last_status = 0;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
     loop {
-        let prompt = if last_status == 0 {
+        let last_status = rl.helper().unwrap().ctx.last_status();
+        let prompt = if last_status.is_success() {
             "> ".to_owned()
         } else {
             format!("[{last_status}]> ")
@@ -85,7 +85,7 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
             Err(ReadlineError::Interrupted) => continue,
             Err(err) => return Err(err.into()),
         };
-        let ctx = &mut rl.helper_mut().unwrap().ctx;
+        let ctx = &mut *rl.helper_mut().unwrap().ctx;
 
         let src = match parse_source(&input) {
             Ok(src) => src,
@@ -96,7 +96,7 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
                     .snippet(Snippet::source(&input).annotation(Level::Error.span(err.span())));
                 println!("{}", renderer.render(msg));
 
-                last_status = 127;
+                ctx.set_last_status(ExitStatus(127));
                 continue;
             }
         };
@@ -105,14 +105,9 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
         // Prevent next prompt from clobbering the output if it contains no newline.
         println!();
 
-        last_status = match ret {
-            Ok(()) => 0,
-            Err(Error::ExitCode(code)) => code,
-            Err(err) => {
-                eprintln!("{err}");
-                127
-            }
-        };
+        if let Err(err) = ret {
+            eprintln!("{err}");
+        }
     }
     Ok(())
 }

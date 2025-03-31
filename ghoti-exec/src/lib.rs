@@ -20,16 +20,48 @@ use utils::{validate_function_name, validate_variable_words};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub type ExecResult<T = ()> = Result<T>;
+pub type ExecResult<T = ExitStatus> = Result<T>;
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitStatus(pub i32);
+
+impl ExitStatus {
+    pub fn is_success(self) -> bool {
+        self == Self::SUCCESS
+    }
+}
+
+impl ExitStatus {
+    pub const SUCCESS: Self = Self(0);
+    pub const FAILURE: Self = Self(1);
+}
+
+impl fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<i32> for ExitStatus {
+    fn from(n: i32) -> Self {
+        Self(n)
+    }
+}
+
+impl From<bool> for ExitStatus {
+    fn from(b: bool) -> Self {
+        match b {
+            true => Self::SUCCESS,
+            false => Self::FAILURE,
+        }
+    }
+}
 
 pub type Value = String;
 pub type ValueList = Vec<String>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("command exited with {0}")]
-    ExitCode(i32),
-
     #[error("{0}")]
     Custom(String),
     #[error("io error: {0}")]
@@ -60,6 +92,13 @@ pub enum Error {
     CloneHandle(io::Error),
     #[error("failed to wait process: {0}")]
     WaitProcess(io::Error),
+}
+
+impl Error {
+    pub fn to_status(&self) -> ExitStatus {
+        // TODO
+        ExitStatus::FAILURE
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -95,10 +134,13 @@ impl Io {
     pub fn write_stdout(&self, s: impl fmt::Display) -> ExecResult {
         match &self.stdout {
             // FIXME: how to async write stdout?
-            Stdio::Inherit => std::io::stdout()
-                .lock()
-                .write_fmt(format_args!("{s}"))
-                .map_err(Error::Io),
+            Stdio::Inherit => {
+                std::io::stdout()
+                    .lock()
+                    .write_fmt(format_args!("{s}"))
+                    .map_err(Error::Io)?;
+                Ok(ExitStatus::SUCCESS)
+            }
             Stdio::Close => Err(Error::PipeClosed),
             Stdio::Collect(sink) => sink(s.to_string().as_bytes()),
             Stdio::Raw(_) => todo!(),
@@ -228,6 +270,7 @@ pub struct ExecContext<'a> {
     func_vars: BTreeMap<String, ValueList>,
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
+    last_status: ExitStatus,
 }
 
 impl Deref for ExecContext<'_> {
@@ -244,6 +287,7 @@ impl<'a> ExecContext<'a> {
             func_vars: BTreeMap::new(),
             root,
             outer: None,
+            last_status: ExitStatus::SUCCESS,
         }
     }
 
@@ -252,7 +296,16 @@ impl<'a> ExecContext<'a> {
             func_vars: BTreeMap::new(),
             root: outer.root,
             outer: Some(outer),
+            last_status: ExitStatus::SUCCESS,
         }
+    }
+
+    pub fn last_status(&self) -> ExitStatus {
+        self.last_status
+    }
+
+    pub fn set_last_status(&mut self, n: impl Into<ExitStatus>) {
+        self.last_status = n.into();
     }
 
     pub fn backtrace(&self) -> impl Iterator<Item = &Self> {
@@ -349,21 +402,25 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    fn exec_stmt_boxed(&mut self, stmt: &Stmt, io: Io) -> impl Future<Output = ExecResult> {
-        Box::pin(self.exec_stmt(stmt, io))
-    }
-
     pub async fn exec_stmts(&mut self, stmts: &[Stmt], io: Io) -> ExecResult {
-        let Some((last, init)) = stmts.split_last() else {
-            return Ok(());
-        };
-        for s in init {
-            let _: Result<_> = self.exec_stmt_boxed(s, io.clone()).await;
+        let mut last = ExitStatus::SUCCESS;
+        for s in stmts {
+            last = self.exec_stmt(s, io.clone()).await?;
         }
-        self.exec_stmt(last, io).await
+        Ok(last)
     }
 
-    pub async fn exec_stmt(&mut self, stmt: &Stmt, mut io: Io) -> ExecResult {
+    pub async fn exec_stmt(&mut self, stmt: &Stmt, io: Io) -> ExecResult {
+        let ret = Box::pin(self.exec_stmt_inner(stmt, io)).await;
+        let st = match &ret {
+            Ok(n) => *n,
+            Err(err) => err.to_status(),
+        };
+        self.set_last_status(st);
+        ret
+    }
+
+    async fn exec_stmt_inner(&mut self, stmt: &Stmt, mut io: Io) -> ExecResult {
         match stmt {
             Stmt::Command(words) => {
                 let words = self.expand_words(words).await?;
@@ -371,18 +428,22 @@ impl<'a> ExecContext<'a> {
             }
             Stmt::Block(stmts) => Box::pin(self.exec_stmts(stmts, io)).await,
             Stmt::If(cond, then, else_) => {
-                let cond = self.exec_stmt_boxed(cond, io.clone()).await.is_ok();
-                if cond {
-                    self.exec_stmt_boxed(then, io).await
+                self.exec_stmt(cond, io.clone()).await?;
+                if self.last_status().is_success() {
+                    self.exec_stmt(then, io).await
                 } else if let Some(else_) = else_ {
-                    self.exec_stmt_boxed(else_, io).await
+                    self.exec_stmt(else_, io).await
                 } else {
-                    Ok(())
+                    Ok(ExitStatus::SUCCESS)
                 }
             }
+            Stmt::Switch(_, _) => todo!(),
             Stmt::While(cond, body) => loop {
-                self.exec_stmt_boxed(cond, io.clone()).await?;
-                let _ret = self.exec_stmt_boxed(body, io.clone()).await;
+                self.exec_stmt(cond, io.clone()).await?;
+                if !self.last_status().is_success() {
+                    break Ok(self.last_status());
+                }
+                self.exec_stmt(body, io.clone()).await?;
             },
             Stmt::For(var, elem_ws, body) => {
                 let var = self.expand_words(slice::from_ref(var)).await?;
@@ -390,10 +451,12 @@ impl<'a> ExecContext<'a> {
                 let elems = self.expand_words(elem_ws).await?;
                 for elem in elems {
                     self.set_var(var, VarScope::default(), [elem]);
-                    self.exec_stmt_boxed(body, io.clone()).await?;
+                    self.exec_stmt(body, io.clone()).await?;
                 }
-                Ok(())
+                Ok(self.last_status())
             }
+            Stmt::Break => todo!(),
+            Stmt::Continue => todo!(),
             Stmt::Function(words, stmt) => {
                 let words = &*self.expand_words(words).await?;
                 let [name] = words else {
@@ -402,8 +465,9 @@ impl<'a> ExecContext<'a> {
                 validate_function_name(name)?;
                 let func_cmd = Command::new_function((**stmt).clone());
                 self.set_global_func(name.into(), func_cmd);
-                Ok(())
+                Ok(ExitStatus::SUCCESS)
             }
+            Stmt::Return(_) => todo!(),
             Stmt::Redirect(stmt, redirects) => {
                 for redir in redirects {
                     let (RedirectDest::File(file_word) | RedirectDest::Fd(file_word)) = &redir.dest;
@@ -435,7 +499,7 @@ impl<'a> ExecContext<'a> {
                     }
                 }
 
-                self.exec_stmt_boxed(stmt, io).await
+                self.exec_stmt(stmt, io).await
             }
             Stmt::Pipe(port, lhs, rhs) => {
                 let (pipe_r, pipe_w) = os_pipe::pipe().map_err(Error::CreatePipe)?;
@@ -465,18 +529,24 @@ impl<'a> ExecContext<'a> {
                 // TODO: pipestatus
                 ret2
             }
-            Stmt::Not(stmt) => match self.exec_stmt_boxed(stmt, io).await {
-                Ok(()) => Err(Error::ExitCode(0)),
-                Err(_) => Ok(()),
-            },
-            Stmt::And(lhs, rhs) => {
-                self.exec_stmt_boxed(lhs, io.clone()).await?;
-                self.exec_stmt_boxed(rhs, io).await
+            Stmt::Not(stmt) => {
+                let n = self.exec_stmt(stmt, io).await?;
+                Ok((!n.is_success()).into())
             }
-            Stmt::Or(lhs, rhs) => match self.exec_stmt_boxed(lhs, io.clone()).await {
-                Ok(()) => Ok(()),
-                Err(_) => self.exec_stmt_boxed(rhs, io).await,
-            },
+            Stmt::And(stmt) => {
+                if self.last_status.is_success() {
+                    self.exec_stmt(stmt, io).await
+                } else {
+                    Ok(self.last_status)
+                }
+            }
+            Stmt::Or(stmt) => {
+                if self.last_status.is_success() {
+                    Ok(self.last_status)
+                } else {
+                    self.exec_stmt(stmt, io.clone()).await
+                }
+            }
         }
     }
 
@@ -569,12 +639,12 @@ impl<'a> ExecContext<'a> {
                                     .ok_or(Error::PipeClosed)?
                                     .borrow_mut()
                                     .extend_from_slice(bytes);
-                                Ok(())
+                                Ok(ExitStatus::SUCCESS)
                             })),
                             ..Io::default()
                         };
                         // TODO: check status?
-                        let _ret = self.exec_stmt_boxed(stmt, io).await;
+                        let _ret = self.exec_stmt(stmt, io).await;
                         let buf = Rc::into_inner(buf).unwrap().into_inner();
                         let mut buf = String::from_utf8(buf).expect("TODO");
 

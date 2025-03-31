@@ -14,19 +14,22 @@ extern {
         STRING_FRAGMENT => Token::Verbatim(<&'i str>),
         "$VAR" => Token::Variable(<&'i str>),
 
-        "begin" => Token::Begin,
-        "end" => Token::End,
         "if" => Token::If,
         "else" => Token::Else,
-        "switch" => Token::Switch,
-        "case" => Token::Case,
-        "while" => Token::While,
         "for" => Token::For,
         "in" => Token::In,
-        "; and" => Token::SemiAnd,
-        "; or" => Token::SemiOr,
-        "not" => Token::Not,
+        "while" => Token::While,
+        "break" => Token::Break,
+        "continue" => Token::Continue,
         "function" => Token::Function,
+        "return" => Token::Return,
+        "begin" => Token::Begin,
+        "end" => Token::End,
+        "switch" => Token::Switch,
+        "case" => Token::Case,
+        "and" => Token::And,
+        "or" => Token::Or,
+        "not" => Token::Not,
 
         "$(" => Token::DollarLParen,
         "(" => Token::LParen,
@@ -68,13 +71,20 @@ StmtList: Vec<Stmt> = {
 EOS: () = { NEWLINE, ";" };
 
 Stmt: Stmt = {
+    <StmtNoCond>,
+
+    "and" <Stmt> => Stmt::And(<>.into()),
+    "or" <Stmt> => Stmt::Or(<>.into()),
+}
+
+StmtNoCond: Stmt = {
     #[precedence(level = "0")]
     <Control> => <>,
     #[precedence(level = "0")]
     <Word+> => Stmt::Command(<>),
 
     #[precedence(level = "1")]
-    <mut s:Stmt> <r:Redirect> => {
+    <mut s:StmtNoCond> <r:Redirect> => {
         match &mut s {
             Stmt::Redirect(_, rs) => { rs.push(r); s },
             _ => Stmt::Redirect(s.into(), vec![r]),
@@ -83,18 +93,10 @@ Stmt: Stmt = {
 
     #[precedence(level = "2")]
     #[assoc(side = "right")]
-    <lhs:Stmt> <port:PipeOp> <rhs:Stmt> => Stmt::Pipe(port, lhs.into(), rhs.into()),
+    <lhs:StmtNoCond> <port:PipeOp> <rhs:StmtNoCond> => Stmt::Pipe(port, lhs.into(), rhs.into()),
 
     #[precedence(level = "3")]
-    "not" <Stmt> => Stmt::Not(<>.into()),
-
-    #[precedence(level = "4")]
-    #[assoc(side = "right")]
-    <lhs:Stmt> "; and" <rhs:Stmt> => Stmt::And(lhs.into(), rhs.into()),
-
-    #[precedence(level = "5")]
-    #[assoc(side = "right")]
-    <lhs:Stmt> "; or" <rhs:Stmt> => Stmt::Or(lhs.into(), rhs.into()),
+    "not" <StmtNoCond> => Stmt::Not(<>.into()),
 };
 
 PipeOp: RedirectPort = {
@@ -145,10 +147,13 @@ StmtBlock: Stmt =
 Control: Stmt = {
     "begin" EOS <StmtBlock> "end",
     <If> => <>,
-    "while" <cond:Stmt> EOS <body:StmtBlock> "end" => Stmt::While(cond.into(), body.into()),
     "for" <var:Word> "in" <seq:Word*> EOS <body:StmtBlock> "end" => Stmt::For(var, seq, body.into()),
-    // TODO: Switch
+    "while" <cond:Stmt> EOS <body:StmtBlock> "end" => Stmt::While(cond.into(), body.into()),
+    "break" => Stmt::Break,
+    "continue" => Stmt::Continue,
     "function" <def:Word*> EOS <body:StmtBlock> "end" => Stmt::Function(def, body.into()),
+    "return" <Word?> => Stmt::Return(<>),
+    "switch" <testee:Word> EOS <cases:SwitchCase*> "end" => Stmt::Switch(testee, cases),
 };
 
 If: Stmt = {
@@ -159,6 +164,9 @@ If: Stmt = {
     "if" <cond:Stmt> EOS <then:StmtBlock> "else" EOS <else_:StmtBlock> "end" =>
         Stmt::If(cond.into(), then.into(), Some(else_.into())),
 };
+
+SwitchCase: SwitchCase =
+    "case" <globs:Word*> EOS <body:StmtBlock> => SwitchCase { globs, body };
 
 Word: Word = {
     <WordFrag> => Word::from(<>),

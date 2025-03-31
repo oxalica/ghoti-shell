@@ -9,7 +9,9 @@ use either::Either;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::utils::validate_variable_name;
-use crate::{Command, Error, ExecContext, ExecResult, Io, Stdio, StdioCollectSink, VarScope};
+use crate::{
+    Command, Error, ExecContext, ExecResult, ExitStatus, Io, Stdio, StdioCollectSink, VarScope,
+};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> {
     [
@@ -81,7 +83,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs, io: Io) -> ExecResult
         Some((name, vals)) => {
             validate_variable_name(name)?;
             ctx.set_var(name, scope, vals);
-            Ok(())
+            Ok(ExitStatus::SUCCESS)
         }
     }
 }
@@ -108,11 +110,8 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs, io: Io) -> Ex
         let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
         io.write_stdout(out)
     } else if args.query {
-        if args.args.iter().any(|name| ctx.get_builtin(name).is_some()) {
-            Ok(())
-        } else {
-            Err(Error::ExitCode(1))
-        }
+        let ok = args.args.iter().any(|name| ctx.get_builtin(name).is_some());
+        Ok(ok.into())
     } else {
         ensure!(!args.args.is_empty(), "missing builtin name");
         let cmd = ctx
@@ -142,7 +141,7 @@ pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> E
         loop {
             let buf = stdout.fill_buf().await.map_err(Error::Io)?;
             if buf.is_empty() {
-                return Ok(());
+                return Ok(ExitStatus::SUCCESS);
             }
             sink(buf)?;
             let len = buf.len();
@@ -185,8 +184,8 @@ pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> E
         .spawn()
         .map_err(|err| Error::SpawnProcess(cmd.into(), err))?;
 
-    let mut copy_stdout = Either::Left(ready(ExecResult::Ok(())));
-    let mut copy_stderr = Either::Left(ready(ExecResult::Ok(())));
+    let mut copy_stdout = Either::Left(ready(ExecResult::Ok(ExitStatus::SUCCESS)));
+    let mut copy_stderr = Either::Left(ready(ExecResult::Ok(ExitStatus::SUCCESS)));
     if let Some(sink) = stdout_sink {
         copy_stdout = Either::Right(copy_stdio_to_sink(child.stdout.take().unwrap(), sink));
     }
@@ -198,14 +197,20 @@ pub async fn command(_ctx: &mut ExecContext<'_>, args: CommandArgs, io: Io) -> E
     let (ret_wait, _ret_stdout, _ret_stderr) = tokio::join!(child.wait(), copy_stdout, copy_stderr);
     let status = ret_wait.map_err(Error::WaitProcess)?;
     if status.success() {
-        return Ok(());
+        return Ok(ExitStatus::SUCCESS);
+    }
+
+    if let Some(code) = status.code() {
+        return Ok(ExitStatus(code));
     }
 
     #[cfg(unix)]
-    let code = {
+    {
         use std::os::unix::process::ExitStatusExt;
-        status.into_raw()
-    };
+        if let Some(sig) = status.signal() {
+            return Ok(ExitStatus(127 + sig));
+        }
+    }
 
-    Err(Error::ExitCode(code))
+    todo!();
 }

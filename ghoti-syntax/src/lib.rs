@@ -2,7 +2,7 @@ use std::fmt;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
-pub mod parse2;
+pub mod parse;
 
 pub const KEYWORDS: &[&str] = &[
     "begin", "end", "if", "else", "switch", "case", "for", "in", "and", "or", "not", "function",

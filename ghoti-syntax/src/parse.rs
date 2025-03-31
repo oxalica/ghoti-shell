@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use super::SourceFile;
 
-lalrpop_util::lalrpop_mod!(grammar, "/syntax/grammar.rs");
+lalrpop_util::lalrpop_mod!(grammar, "/grammar.rs");
 
 type Result<T, E = ParseError> = std::result::Result<T, E>;
 

@@ -1,0 +1,13 @@
+[package]
+name = "ghoti-syntax"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lalrpop-util = { version = "0.22", default-features = false }
+logos = "0.15"
+thiserror = "2"
+
+[build-dependencies]
+lalrpop = { version = "0.22", default-features = false, features = ["lexer"] }

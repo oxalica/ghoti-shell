@@ -1,4 +1,4 @@
-use crate::syntax::KEYWORDS;
+use ghoti_syntax::KEYWORDS;
 
 use super::{Error, ExecResult};
 

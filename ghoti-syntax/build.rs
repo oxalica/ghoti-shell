@@ -1,4 +1,4 @@
-const GRAMMER_FILE: &str = "src/syntax/grammar.lalrpop";
+const GRAMMER_FILE: &str = "src/grammar.lalrpop";
 
 fn main() {
     println!("cargo::rerun-if-changed={GRAMMER_FILE}");

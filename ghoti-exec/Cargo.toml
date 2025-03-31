@@ -1,0 +1,16 @@
+[package]
+name = "ghoti-exec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argh = { version = "0.1.13", default-features = false }
+bitflags = "2.9.0"
+dyn-clone = "1.0.19"
+either = "1.15.0"
+ghoti-syntax.path = "../ghoti-syntax"
+itertools = "0.14.0"
+os_pipe = "1.2.1"
+thiserror = "2"
+tokio = "1.44"

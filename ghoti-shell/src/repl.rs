@@ -1,8 +1,8 @@
 use std::ops::ControlFlow;
 
 use annotate_snippets::{Level, Renderer, Snippet};
-use ghoti_shell::exec::{Error, ExecContext, Executor, Io};
-use ghoti_shell::syntax::parse2::parse_source;
+use ghoti_exec::{Error, ExecContext, Io};
+use ghoti_syntax::parse::parse_source;
 use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -11,11 +11,11 @@ use rustyline::history::DefaultHistory;
 use rustyline::{Editor, Helper, Highlighter, Validator};
 
 #[derive(Helper, Validator, Highlighter)]
-struct ShellHelper<'a> {
-    ctx: ExecContext<'a>,
+struct ShellHelper<'a, 'ctx> {
+    ctx: &'a mut ExecContext<'ctx>,
 }
 
-impl Hinter for ShellHelper<'_> {
+impl Hinter for ShellHelper<'_, '_> {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
@@ -35,7 +35,7 @@ impl Hinter for ShellHelper<'_> {
     }
 }
 
-impl Completer for ShellHelper<'_> {
+impl Completer for ShellHelper<'_, '_> {
     type Candidate = String;
 
     fn complete(
@@ -61,9 +61,7 @@ impl Completer for ShellHelper<'_> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let exec = Executor::default();
-    let ctx = ExecContext::new(&exec);
+pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let renderer = Renderer::styled();
 
     let mut rl: Editor<ShellHelper, DefaultHistory> = rustyline::Editor::new()?;

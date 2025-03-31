@@ -8,9 +8,8 @@ use argh::FromArgs;
 use either::Either;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
-use crate::exec::{Stdio, StdioCollectSink, validate_variable_name};
-
-use super::{Command, Error, ExecContext, ExecResult, Io, VarScope};
+use crate::utils::validate_variable_name;
+use crate::{Command, Error, ExecContext, ExecResult, Io, Stdio, StdioCollectSink, VarScope};
 
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, Command)> {
     [

@@ -1,0 +1,13 @@
+[package]
+name = "ghoti-shell"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+annotate-snippets = "0.11.5"
+ghoti-exec.path = "../ghoti-exec"
+ghoti-syntax.path = "../ghoti-syntax"
+owo-colors = "4.2.0"
+rustyline = { version = "15.0.0", features = ["derive"] }
+tokio = { version = "1.44.1", features = ["io-util", "macros", "process", "rt"] }

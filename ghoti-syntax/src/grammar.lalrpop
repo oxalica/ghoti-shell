@@ -1,5 +1,5 @@
-use crate::syntax::*;
-use crate::syntax::parse2::{Token, ParseError as E, ParseErrorKind as K};
+use crate::*;
+use crate::parse::{Token, ParseError as E, ParseErrorKind as K};
 
 grammar<'i>;
 

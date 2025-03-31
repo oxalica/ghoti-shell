@@ -10,13 +10,13 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::{fmt, slice};
 
-use crate::syntax::{self, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag};
+use ghoti_syntax::{self as ast, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag};
 
 pub mod builtins;
 mod utils;
 
 use either::Either;
-pub use utils::*;
+use utils::{validate_function_name, validate_variable_words};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -497,7 +497,7 @@ impl<'a> ExecContext<'a> {
     }
 
     // TODO: Word and size limit.
-    async fn expand_words(&mut self, words: &[syntax::Word]) -> Result<Vec<String>> {
+    async fn expand_words(&mut self, words: &[ast::Word]) -> Result<Vec<String>> {
         fn dfs(
             ret: &mut Vec<String>,
             stack: &mut String,
@@ -537,11 +537,11 @@ impl<'a> ExecContext<'a> {
 
         for w in words {
             let frags = match w {
-                syntax::Word::Simple(w) => {
+                ast::Word::Simple(w) => {
                     ret.push(w.clone());
                     continue;
                 }
-                syntax::Word::Complex(frags) => frags,
+                ast::Word::Complex(frags) => frags,
             };
 
             let mut expanded = Vec::with_capacity(frags.len());

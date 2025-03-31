@@ -66,7 +66,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs, io: Io) -> ExecResult
             ctx.list_vars::<()>(scope, |name, vals| {
                 buf.push_str(name);
                 if !vals.is_empty() {
-                    buf.push_str(" ");
+                    buf.push(' ');
                     for (idx, val) in vals.iter().enumerate() {
                         if idx != 0 {
                             buf.push_str("  ");

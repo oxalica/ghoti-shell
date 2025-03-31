@@ -148,7 +148,7 @@ Control: Stmt = {
     "while" <cond:Stmt> EOS <body:StmtBlock> "end" => Stmt::While(cond.into(), body.into()),
     "for" <var:Word> "in" <seq:Word*> EOS <body:StmtBlock> "end" => Stmt::For(var, seq, body.into()),
     // TODO: Switch
-    "function" <def:Word*> EOS <body:StmtBlock> "end" => Stmt::Function(def.into(), body.into()),
+    "function" <def:Word*> EOS <body:StmtBlock> "end" => Stmt::Function(def, body.into()),
 };
 
 If: Stmt = {

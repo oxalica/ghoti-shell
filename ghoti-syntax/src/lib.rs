@@ -37,7 +37,7 @@ pub enum Stmt {
     Switch(Pos, Word, Vec<SwitchCase>),
 
     Redirect(Pos, Box<Stmt>, Vec<Redirect>),
-    Pipe(Pos, RedirectPort, Box<Stmt>, Box<Stmt>),
+    Pipe(Pos, Vec<(Stmt, RedirectPort)>, Box<Stmt>),
 
     Not(Pos, Box<Stmt>),
     And(Pos, Box<Stmt>),

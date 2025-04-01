@@ -46,7 +46,7 @@ define_visitor! {
             Stmt::Return(pos, w) => v.visit_return_stmt_mut(*pos, w.as_mut()),
             Stmt::Switch(pos, testee, cases) => v.visit_switch_stmt_mut(*pos, testee, cases),
             Stmt::Redirect(pos, s, redirects) => v.visit_redirect_stmt_mut(*pos, s, redirects),
-            Stmt::Pipe(pos, port, lhs, rhs) => v.visit_pipe_stmt_mut(*pos, port, lhs, rhs),
+            Stmt::Pipe(pos, pipes, rhs) => v.visit_pipe_stmt_mut(*pos, pipes, rhs),
             Stmt::Not(pos, s) => v.visit_not_stmt_mut(*pos, s),
             Stmt::And(pos, s) => v.visit_and_stmt_mut(*pos, s),
             Stmt::Or(pos, s) => v.visit_or_stmt_mut(*pos, s),
@@ -105,9 +105,11 @@ define_visitor! {
         redirects.iter_mut().for_each(|redir| v.visit_redirect_mut(redir));
     }
 
-    fn visit_pipe_stmt_mut(v, _pos: Pos, port: &'i mut RedirectPort, lhs: &'i mut Stmt, rhs: &'i mut Stmt) {
-        v.visit_redirect_port_mut(port);
-        v.visit_stmt_mut(lhs);
+    fn visit_pipe_stmt_mut(v, _pos: Pos, pipes: &'i mut Vec<(Stmt, RedirectPort)>, rhs: &'i mut Stmt) {
+        for (lhs, port) in pipes {
+            v.visit_stmt_mut(lhs);
+            v.visit_redirect_port_mut(port);
+        }
         v.visit_stmt_mut(rhs);
     }
 

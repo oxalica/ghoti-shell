@@ -87,7 +87,16 @@ Stmt: Stmt = {
 
     #[precedence(level = "2")]
     #[assoc(side = "right")]
-    <lhs:Stmt> <pos:@L> <port:PipeOp> <rhs:Stmt> => Stmt::Pipe(pos as _, port, lhs.into(), rhs.into()),
+    <lhs:Stmt> <pos:@L> <port:PipeOp> <mut rhs:Stmt> => {
+        match &mut rhs {
+            Stmt::Pipe(_, pipes, _) => {
+                // FIXME: O(n^2) time.
+                pipes.insert(0, (lhs, port));
+                rhs
+            }
+            _ => Stmt::Pipe(pos as _, vec![(lhs, port)], rhs.into()),
+        }
+    },
 
     #[precedence(level = "3")]
     <pos:@L> "not" <s:Stmt> => Stmt::Not(pos as _, s.into()),

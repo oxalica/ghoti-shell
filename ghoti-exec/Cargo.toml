@@ -8,6 +8,7 @@ license.workspace = true
 clap = { version = "4.5.34", default-features = false, features = ["derive", "std"] }
 dyn-clone = "1.0.19"
 either = "1.15.0"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 ghoti-syntax.path = "../ghoti-syntax"
 itertools = "0.14.0"
 os_pipe = "1.2.1"

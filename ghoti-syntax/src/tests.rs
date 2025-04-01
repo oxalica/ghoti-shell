@@ -113,3 +113,14 @@ fn home() {
     parse_source("echo ~a").unwrap_err();
     parse_source("echo a~").unwrap_err();
 }
+
+#[test]
+fn pipe() {
+    let src = "1 | 2 &2>| 3 &| 4";
+    let ast = parse_source(src).unwrap();
+    assert!(matches!(
+        &ast.stmts[0],
+        Stmt::Pipe(_, pipes, _)
+        if pipes.len() == 3
+    ));
+}

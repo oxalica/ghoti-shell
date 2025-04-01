@@ -258,7 +258,15 @@ impl Default for Executor {
         let mut this = Self::new();
         this.builtin_funcs
             .extend(builtins::all_builtins().map(|(name, cmd)| (name.to_owned(), cmd)));
+
         this.set_special_var("status", |ctx| vec![ctx.last_status().to_string()]);
+        this.set_special_var("pipestatus", |ctx| {
+            ctx.last_pipe_status()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+
         this
     }
 }
@@ -358,6 +366,7 @@ pub struct ExecContext<'a> {
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
     last_status: Status,
+    last_pipe_status: Vec<Status>,
     io: Io,
 }
 
@@ -386,6 +395,7 @@ impl<'a> ExecContext<'a> {
             root,
             outer: None,
             last_status: Status::SUCCESS,
+            last_pipe_status: Vec::new(),
             io: Io::default(),
         }
     }
@@ -398,6 +408,7 @@ impl<'a> ExecContext<'a> {
             root: outer.root,
             outer: Some(outer),
             last_status: Status::SUCCESS,
+            last_pipe_status: Vec::new(),
             io: outer.io.clone(),
         }
     }
@@ -408,6 +419,10 @@ impl<'a> ExecContext<'a> {
 
     pub fn set_last_status(&mut self, n: impl Into<Status>) {
         self.last_status = n.into();
+    }
+
+    pub fn last_pipe_status(&self) -> &[Status] {
+        &self.last_pipe_status
     }
 
     pub fn io(&self) -> &Io {
@@ -803,35 +818,50 @@ impl<'a> ExecContext<'a> {
 
                 this.exec_stmt(stmt).await?;
             }
-            Stmt::Pipe(_pos, port, lhs, rhs) => {
-                let (pipe_r, pipe_w) = tri!(os_pipe::pipe().map_err(Error::CreatePipe));
-                let pipe_r = Stdio::Raw(Rc::new(pipe_r.into()));
-                let pipe_w = Stdio::Raw(Rc::new(pipe_w.into()));
+            Stmt::Pipe(_pos, pipes, last) => {
+                let task_cnt = pipes.len() + 1;
 
-                let mut lctx = ExecContext::new_inside(self);
-                let mut rctx = ExecContext::new_inside(self);
-                match *port {
-                    RedirectPort::STDOUT => lctx.io.stdout = pipe_w,
-                    RedirectPort::STDERR => lctx.io.stderr = pipe_w,
-                    RedirectPort::STDOUT_STDERR => {
-                        (lctx.io.stdout, lctx.io.stderr) = (pipe_w.clone(), pipe_w)
-                    }
-                    _ => todo!(),
+                async fn task(mut ctx: ExecContext<'_>, stmt: &Stmt) -> Status {
+                    ctx.exec_stmt(stmt).await;
+                    ctx.last_status()
                 }
-                rctx.io.stdin = pipe_r;
 
-                let (_st1, st2) = tokio::join!(
-                    Box::pin(async move {
-                        lctx.exec_stmt(lhs).await;
-                        lctx.last_status()
-                    }),
-                    Box::pin(async move {
-                        rctx.exec_stmt(rhs).await;
-                        rctx.last_status()
-                    }),
-                );
-                // TODO: pipestatus
-                self.set_last_status(st2);
+                let pipe_status = {
+                    let mut tasks = Vec::with_capacity(task_cnt);
+
+                    let mut subctx = ExecContext::new_inside(self);
+                    for (lhs, port) in pipes {
+                        let (pipe_r, pipe_w) = match os_pipe::pipe().map_err(Error::CreatePipe) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                drop(tasks);
+                                self.emit_error(err).await;
+                                return ControlFlow::Continue(());
+                            }
+                        };
+                        let pipe_r = Stdio::Raw(Rc::new(pipe_r.into()));
+                        let pipe_w = Stdio::Raw(Rc::new(pipe_w.into()));
+
+                        match *port {
+                            RedirectPort::STDOUT => subctx.io.stdout = pipe_w,
+                            RedirectPort::STDERR => subctx.io.stderr = pipe_w,
+                            RedirectPort::STDOUT_STDERR => {
+                                (subctx.io.stdout, subctx.io.stderr) = (pipe_w.clone(), pipe_w)
+                            }
+                            _ => todo!(),
+                        }
+                        tasks.push(task(subctx, lhs));
+
+                        subctx = ExecContext::new_inside(self);
+                        subctx.io.stdin = pipe_r;
+                    }
+                    tasks.push(task(subctx, last));
+
+                    futures_util::future::join_all(tasks).await
+                };
+
+                self.set_last_status(pipe_status.last().copied().unwrap());
+                self.last_pipe_status = pipe_status;
             }
             Stmt::Not(_pos, stmt) => {
                 self.exec_stmt(stmt).await?;

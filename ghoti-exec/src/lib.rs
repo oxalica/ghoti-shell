@@ -34,7 +34,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type ExecResult<T = Status> = Result<T>;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Status(pub i32);
+pub struct Status(pub u8);
 
 impl Status {
     pub fn is_success(self) -> bool {
@@ -53,9 +53,15 @@ impl fmt::Display for Status {
     }
 }
 
-impl From<i32> for Status {
-    fn from(n: i32) -> Self {
+impl From<u8> for Status {
+    fn from(n: u8) -> Self {
         Self(n)
+    }
+}
+
+impl From<usize> for Status {
+    fn from(n: usize) -> Self {
+        Self(u8::try_from(n).unwrap_or(u8::MAX))
     }
 }
 
@@ -127,6 +133,12 @@ pub enum Error {
     // TODO
     #[error("invalid UTF8 in {0}")]
     InvalidUtf8(String),
+}
+
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Self::Custom(s)
+    }
 }
 
 impl Error {

@@ -15,6 +15,22 @@ use crate::{
     Error, ExecBreak, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable,
 };
 
+macro_rules! bail {
+    ($($msg:tt)+) => {
+        return Err(crate::Error::Custom(format!($($msg)+)).into())
+    };
+}
+
+macro_rules! ensure {
+    ($cond:expr, $($msg:tt)+) => {
+        if !$cond {
+            bail!($($msg)+);
+        }
+    };
+}
+
+pub mod test;
+
 pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand)> {
     [
         (
@@ -24,16 +40,9 @@ pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand
         ("set", Box::new(command::parsed_builtin(set))),
         ("builtin", Box::new(command::parsed_builtin(builtin))),
         ("source", Box::new(command::raw_builtin(source))),
+        ("test", Box::new(command::raw_builtin(test::test))),
     ]
     .into_iter()
-}
-
-macro_rules! ensure {
-    ($cond:expr, $($msg:tt)+) => {
-        if !$cond {
-            return Err(Error::Custom(format!($($msg)+)).into());
-        }
-    };
 }
 
 #[derive(Debug, Parser)]
@@ -203,7 +212,7 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
     let (cmd, args) = args.args.split_first().ok_or(Error::EmptyCommand)?;
 
     let cvt_stdio = |s: &Stdio, is_stdin: bool| {
-        Ok(match s {
+        Ok::<_, Error>(match s {
             Stdio::Inherit => (process::Stdio::inherit(), None),
             Stdio::Close => todo!(),
             Stdio::Collect(sink) => {
@@ -261,13 +270,14 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
     }
 
     if let Some(code) = status.code() {
-        return Ok(Status(code));
+        return Ok(Status(u8::try_from(code).unwrap_or(u8::MAX)));
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(sig) = status.signal() {
+            let sig = sig.clamp(0, 128) as u8;
             return Ok(Status(127 + sig));
         }
     }

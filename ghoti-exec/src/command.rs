@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
@@ -17,7 +18,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// Builtins and user functions are all its instances.
 ///
 /// It must be cheaply clone-able.
-pub trait Command: fmt::Debug + dyn_clone::DynClone + 'static {
+pub trait Command: Any + fmt::Debug + dyn_clone::DynClone + 'static {
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
@@ -39,6 +40,12 @@ pub trait ReportResult {
 impl ReportResult for () {
     async fn report(self, _ctx: &mut ExecContext<'_>) -> Status {
         Status::SUCCESS
+    }
+}
+
+impl ReportResult for bool {
+    async fn report(self, _ctx: &mut ExecContext<'_>) -> Status {
+        Status::from(self)
     }
 }
 

@@ -1,7 +1,7 @@
 use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write};
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -15,7 +15,6 @@ use ghoti_syntax::{
     self as ast, RedirectDest, RedirectMode, RedirectPort, SourceFile, Stmt, WordFrag,
 };
 use itertools::EitherOrBoth;
-use tokio::io::AsyncWriteExt;
 use utils::validate_variable_name;
 
 use crate::utils::validate_function_name;
@@ -178,21 +177,23 @@ impl fmt::Debug for Stdio {
 }
 
 impl Io {
-    pub async fn write_stdout(&self, bytes: impl AsRef<[u8]>) -> ExecResult {
-        let bytes = bytes.as_ref();
+    pub async fn write_stdout(&self, bytes: impl AsRef<[u8]> + Send + 'static) -> ExecResult {
         match &self.stdout {
+            Stdio::Close => Err(Error::PipeClosed),
+            Stdio::Collect(sink) => sink(bytes.as_ref()),
+            // FIXME: Should bypass std's lock to avoid deadlocks when using print* macros.
             Stdio::Inherit => {
-                tokio::io::stdout()
-                    .write_all(bytes)
-                    .await
-                    .map_err(Error::ReadWrite)?;
+                tokio::task::spawn_blocking(move || {
+                    let mut lock = std::io::stdout().lock();
+                    lock.write_all(bytes.as_ref())?;
+                    lock.flush()
+                })
+                .await
+                .expect("no panic")
+                .map_err(Error::ReadWrite)?;
                 Ok(Status::SUCCESS)
             }
-            Stdio::Close => Err(Error::PipeClosed),
-            Stdio::Collect(sink) => sink(bytes),
-            Stdio::Raw(_) => {
-                todo!()
-            }
+            Stdio::Raw(_) => todo!(),
         }
     }
 }

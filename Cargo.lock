@@ -320,6 +320,7 @@ dependencies = [
  "ghoti-syntax",
  "itertools",
  "os_pipe",
+ "owo-colors",
  "rustix",
  "scopeguard",
  "thiserror",

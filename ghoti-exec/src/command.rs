@@ -19,6 +19,9 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 ///
 /// It must be cheaply clone-able.
 pub trait Command: Any + fmt::Debug + dyn_clone::DynClone + 'static {
+    // FIXME: Should be unnecessary since Rust 1.86.
+    fn as_any(&self) -> &dyn Any;
+
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
@@ -104,6 +107,10 @@ where
     F: 'static + Clone + AsyncFn(&mut ExecContext<'_>, &[String]) -> Ret,
     Ret: 'static + ReportResult,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
@@ -150,6 +157,10 @@ where
     Args: 'static + clap::Parser,
     Ret: 'static + ReportResult,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
@@ -178,9 +189,19 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct UserFunc(Rc<(Stmt, Option<String>)>);
+pub(crate) struct UserFunc(Rc<(Stmt, Option<String>)>);
+
+impl UserFunc {
+    pub fn stmt(&self) -> &Stmt {
+        &self.0.0
+    }
+}
 
 impl Command for UserFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn exec<'fut>(
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,

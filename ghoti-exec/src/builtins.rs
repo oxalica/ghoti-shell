@@ -3,13 +3,15 @@ use std::future::ready;
 use std::ops::ControlFlow;
 use std::process;
 use std::rc::Rc;
+use std::str::FromStr;
 
 use clap::Parser;
 use either::Either;
 use ghoti_syntax::parse_source;
+use owo_colors::AnsiColors;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
-use crate::command::{self, BoxCommand, UnchangedStatus};
+use crate::command::{self, BoxCommand, UnchangedStatus, UserFunc};
 use crate::utils::validate_variable_name;
 use crate::{
     Error, ExecBreak, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable,
@@ -41,6 +43,8 @@ pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand
         ("builtin", Box::new(command::parsed_builtin(builtin))),
         ("source", Box::new(command::raw_builtin(source))),
         ("test", Box::new(command::raw_builtin(test::test))),
+        ("functions", Box::new(command::parsed_builtin(functions))),
+        ("set_color", Box::new(command::parsed_builtin(set_color))),
     ]
     .into_iter()
 }
@@ -290,12 +294,15 @@ pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<Un
         return Err(Error::Custom("TODO: source from stdin".into()));
     };
 
-    let source = {
-        let src = tokio::fs::read_to_string(path)
-            .await
-            .map_err(Error::ReadWrite)?;
-        parse_source(&src).map_err(|errs| Error::Custom(errs[0].to_string()))?
-    };
+    let path = path.clone();
+    let source = tokio::task::spawn_blocking(move || {
+        let src = std::fs::read_to_string(path).map_err(Error::ReadWrite)?;
+        // TODO: Report more errors.
+        let file = parse_source(&src).map_err(|errs| errs[0].to_string())?;
+        Ok::<_, Error>(file)
+    })
+    .await
+    .expect("no panic")?;
 
     let scope = &mut **ctx.enter_local_scope();
     scope.set_var("argv", VarScope::Local, args.to_vec());
@@ -306,4 +313,165 @@ pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<Un
     }
 
     ExecResult::Ok(UnchangedStatus)
+}
+
+#[derive(Debug, Parser)]
+pub struct FunctionsOpts {
+    #[arg(short, exclusive = true)]
+    pub erase: bool,
+    #[arg(short, exclusive = true)]
+    pub query: bool,
+
+    pub funcs: Vec<String>,
+}
+
+pub async fn functions(ctx: &mut ExecContext<'_>, args: FunctionsOpts) -> ExecResult {
+    if args.erase {
+        let fail_cnt = args
+            .funcs
+            .iter()
+            .map(|name| !ctx.remove_global_func(name) as usize)
+            .sum::<usize>();
+        Ok(fail_cnt.into())
+    } else if args.query {
+        let fail_cnt = args
+            .funcs
+            .iter()
+            .map(|name| ctx.get_func(name).is_none() as usize)
+            .sum::<usize>();
+        Ok(fail_cnt.into())
+    } else {
+        let mut buf = String::new();
+        let mut fail_cnt = 0usize;
+        for name in &args.funcs {
+            if let Some(cmd) = ctx.get_func(name) {
+                let func = cmd.as_any().downcast_ref::<UserFunc>().unwrap();
+                writeln!(buf, "{:#?}", func.stmt()).unwrap();
+            } else {
+                fail_cnt += 1;
+            }
+        }
+        let _: ExecResult<_> = ctx.io().write_stdout(buf).await;
+        Ok(fail_cnt.into())
+    }
+}
+
+#[derive(Debug, Parser)]
+pub struct SetColorOpts {
+    #[arg(long, short)]
+    background: Option<SetColor>,
+
+    #[arg(long, short = 'c')]
+    print_colors: Option<SetColor>,
+
+    #[arg(long, short = 'o')]
+    bold: bool,
+
+    #[arg(long, short)]
+    dim: bool,
+
+    #[arg(long, short)]
+    italics: bool,
+
+    #[arg(long, short)]
+    reverse: bool,
+
+    #[arg(long, short)]
+    underline: bool,
+
+    color: Option<SetColor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetColor {
+    Normal,
+    Ansi(AnsiColors),
+    Rgb(u8, u8, u8),
+}
+
+impl FromStr for SetColor {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || format!("invalid color: {s:?}");
+        Ok(Self::Ansi(match s {
+            "normal" => return Ok(Self::Normal),
+
+            "black" => AnsiColors::Black,
+            "red" => AnsiColors::Red,
+            "green" => AnsiColors::Green,
+            "yellow" => AnsiColors::Yellow,
+            "blue" => AnsiColors::Blue,
+            "magenta" => AnsiColors::Magenta,
+            "cyan" => AnsiColors::Cyan,
+            "white" => AnsiColors::White,
+            "brblack" => AnsiColors::BrightBlack,
+            "brred" => AnsiColors::BrightRed,
+            "brgreen" => AnsiColors::BrightGreen,
+            "bryellow" => AnsiColors::BrightYellow,
+            "brblue" => AnsiColors::BrightBlue,
+            "brmagenta" => AnsiColors::BrightMagenta,
+            "brcyan" => AnsiColors::BrightCyan,
+            "brwhite" => AnsiColors::BrightWhite,
+
+            s if s.len() == 3 => {
+                let v = u32::from_str_radix(s, 16).map_err(|_| err())?;
+                let f = |x: u32| x as u8 * 11;
+                return Ok(Self::Rgb(f(v >> 8), f((v >> 4) & 0xF), f(v & 0xF)));
+            }
+            s if s.len() == 6 => {
+                let v = u32::from_str_radix(s, 16).map_err(|_| err())?;
+                let f = |x: u32| x as u8;
+                return Ok(Self::Rgb(f(v >> 16), f((v >> 8) & 0xFF), f(v & 0xFF)));
+            }
+            _ => return Err(err()),
+        }))
+    }
+}
+
+pub async fn set_color(ctx: &mut ExecContext<'_>, args: SetColorOpts) -> ExecResult {
+    let mut s = owo_colors::Style::new();
+    match args.background {
+        Some(SetColor::Normal) => s = s.on_default_color(),
+        Some(SetColor::Ansi(c)) => s = s.on_color(c),
+        Some(SetColor::Rgb(r, g, b)) => s = s.on_truecolor(r, g, b),
+        None => {}
+    }
+    if args.bold {
+        s = s.bold();
+    }
+    if args.dim {
+        s = s.dimmed();
+    }
+    if args.italics {
+        s = s.italic();
+    }
+    if args.reverse {
+        s = s.reversed();
+    }
+    if args.underline {
+        s = s.underline();
+    }
+
+    match args.color {
+        Some(SetColor::Normal) => s = s.default_color(),
+        Some(SetColor::Ansi(c)) => s = s.color(c),
+        Some(SetColor::Rgb(r, g, b)) => s = s.truecolor(r, g, b),
+        None => {}
+    }
+
+    let reset = if args.color == Some(SetColor::Normal) || args.background == Some(SetColor::Normal)
+    {
+        "\x1B[m"
+    } else {
+        ""
+    };
+
+    let s = format!("{reset}{}", s.prefix_formatter());
+    if !s.is_empty() {
+        let _: ExecResult<_> = ctx.io().write_stdout(s).await;
+        Ok(Status::SUCCESS)
+    } else {
+        Ok(Status::FAILURE)
+    }
 }

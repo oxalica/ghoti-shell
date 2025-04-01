@@ -57,6 +57,9 @@ pub struct SetArgs {
     #[arg(long, short = 'x')]
     export: bool,
 
+    #[arg(long, short = 'e')]
+    erase: bool,
+
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
@@ -68,16 +71,29 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
         .sum::<u8>();
     ensure!(scope_flag_cnt <= 1, "scope flags are mutually exclusive");
     let scope = if args.local {
-        Some(VarScope::Local)
+        VarScope::Local
     } else if args.function {
-        Some(VarScope::Function)
+        VarScope::Function
     } else if args.global {
-        Some(VarScope::Global)
+        VarScope::Global
     } else if args.universal {
-        Some(VarScope::Universal)
+        VarScope::Universal
     } else {
-        None
+        VarScope::Auto
     };
+
+    if args.erase {
+        for name in &args.args {
+            validate_variable_name(name)?;
+        }
+        let mut ok = true;
+        for name in &args.args {
+            if !ctx.remove_var(scope, name) {
+                ok = false;
+            }
+        }
+        return Ok(ok.into());
+    }
 
     match args.args.split_first() {
         None => {
@@ -108,7 +124,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 value: vals.to_vec(),
                 export: args.export,
             };
-            ctx.set_var(name, scope.unwrap_or(VarScope::Function), var);
+            ctx.set_var(name, scope, var);
             Ok(ctx.last_status())
         }
     }
@@ -212,7 +228,7 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
             .stdout(os_stdout)
             .stderr(os_stderr)
             .env_clear();
-        ctx.list_vars::<()>(None, |name, var| {
+        ctx.list_vars::<()>(VarScope::Auto, |name, var| {
             if var.export {
                 builder.env(name, var.value.join(" "));
             }
@@ -267,12 +283,11 @@ pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<Un
         parse_source(&src).map_err(|errs| Error::Custom(errs[0].to_string()))?
     };
 
-    // TODO: Local scope.
-    let mut subctx = ExecContext::new_inside(ctx);
-    subctx.set_var("argv", VarScope::Function, args.to_vec());
-    match subctx.exec_source(&source).await {
+    let scope = &mut **ctx.enter_local_scope();
+    scope.set_var("argv", VarScope::Local, args.to_vec());
+    match scope.exec_source(&source).await {
         ControlFlow::Continue(()) => {}
-        ControlFlow::Break(ExecBreak::FuncReturn(n)) => ctx.set_last_status(n),
+        ControlFlow::Break(ExecBreak::FuncReturn(n)) => scope.set_last_status(n),
         _ => unreachable!(),
     }
 

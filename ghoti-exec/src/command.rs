@@ -181,7 +181,7 @@ impl Command for UserFunc {
     ) -> BoxFuture<'fut, Status> {
         Box::pin(async move {
             let mut subctx = ExecContext::new_inside(ctx);
-            subctx.set_var("argv", VarScope::Function, args[1..].to_vec());
+            subctx.set_var("argv", VarScope::Local, args[1..].to_vec());
             let ctl = subctx.exec_stmt(&self.0.0).await;
             match ctl {
                 ControlFlow::Continue(()) => Status::SUCCESS,

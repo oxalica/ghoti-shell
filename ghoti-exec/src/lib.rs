@@ -14,6 +14,7 @@ use either::Either;
 use ghoti_syntax::{
     self as ast, RedirectDest, RedirectMode, RedirectPort, SourceFile, Stmt, WordFrag,
 };
+use itertools::EitherOrBoth;
 use tokio::io::AsyncWriteExt;
 use utils::validate_variable_name;
 
@@ -104,6 +105,8 @@ pub enum Error {
     CommandNotFound(String),
     #[error("variable not found: {0:?}")]
     VariableNotFound(String),
+    #[error("cannot modify special variable: {0:?}")]
+    ModifySpecialVariable(String),
 
     // System errors.
     #[error("read/write error: {0}")]
@@ -228,11 +231,26 @@ impl From<Vec<String>> for Variable {
     }
 }
 
-#[derive(Debug)]
+type DynSpecialVarGetter = dyn Fn(&ExecContext<'_>) -> ValueList;
+
 pub struct Executor {
     builtin_funcs: BTreeMap<String, Box<dyn Command>>,
     global_funcs: RefCell<BTreeMap<String, Box<dyn Command>>>,
     global_vars: RefCell<BTreeMap<String, Variable>>,
+
+    /// Special read-only variables implemented as getters.
+    special_vars: BTreeMap<String, Box<DynSpecialVarGetter>>,
+}
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Executor")
+            .field("builtin_funcs", &self.builtin_funcs)
+            .field("global_funcs", &self.global_funcs)
+            .field("global_vars", &self.global_vars)
+            .field("special_vars", &self.special_vars.keys())
+            .finish()
+    }
 }
 
 impl Default for Executor {
@@ -240,6 +258,7 @@ impl Default for Executor {
         let mut this = Self::new();
         this.builtin_funcs
             .extend(builtins::all_builtins().map(|(name, cmd)| (name.to_owned(), cmd)));
+        this.set_special_var("status", |ctx| vec![ctx.last_status().to_string()]);
         this
     }
 }
@@ -250,6 +269,7 @@ impl Executor {
             builtin_funcs: BTreeMap::new(),
             global_funcs: RefCell::new(BTreeMap::new()),
             global_vars: RefCell::new(BTreeMap::new()),
+            special_vars: BTreeMap::new(),
         }
     }
 
@@ -276,6 +296,24 @@ impl Executor {
 
     pub fn get_builtin(&self, name: &str) -> Option<BoxCommand> {
         self.builtin_funcs.get(name).cloned()
+    }
+
+    pub fn special_vars(&self) -> impl Iterator<Item = (&str, &DynSpecialVarGetter)> {
+        self.special_vars
+            .iter()
+            .map(|(s, getter)| (&**s, &**getter))
+    }
+
+    pub fn set_special_var(
+        &mut self,
+        name: impl Into<String>,
+        getter: impl Fn(&ExecContext<'_>) -> ValueList + 'static,
+    ) {
+        self.special_vars.insert(name.into(), Box::new(getter));
+    }
+
+    pub fn remove_special_var(&mut self, name: &str) -> bool {
+        self.special_vars.remove(name).is_some()
     }
 
     pub(crate) fn global_funcs(&self) -> Ref<'_, BTreeMap<String, BoxCommand>> {
@@ -411,47 +449,87 @@ impl<'a> ExecContext<'a> {
             .or_else(|| self.get_builtin(name))
     }
 
+    pub fn has_special_var(&self, name: &str) -> bool {
+        self.special_vars.contains_key(name)
+    }
+
+    pub fn get_special_var(&self, name: &str) -> Option<ValueList> {
+        self.special_vars.get(name).map(|getter| getter(self))
+    }
+
     pub fn list_vars<B>(
         &self,
         scope: VarScope,
         mut f: impl FnMut(&str, &Variable) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        let local_vars = self
+        let local_iter = self
             .local_var_map
             .iter()
-            .map(|(name, &idx)| (name, &self.local_vars[idx].as_ref().unwrap().var));
+            .map(|(name, &idx)| (name.as_str(), &self.local_vars[idx].as_ref().unwrap().var));
         match scope {
             // Does not quite make sense, fish also returns empty for this.
             VarScope::Function => return ControlFlow::Continue(()),
             VarScope::Local => {
-                for (name, var) in local_vars {
+                for (name, var) in local_iter {
                     f(name, var)?;
                 }
             }
-            VarScope::Global => {
-                for (name, var) in self.global_vars().iter() {
-                    f(name, var)?;
+            VarScope::Global | VarScope::Auto => {
+                let global_vars = self.global_vars();
+                let mut global_iter = global_vars.iter().map(|(name, var)| (name.as_str(), var));
+                let mut merged_iter;
+                let iter = if scope == VarScope::Global {
+                    &mut global_iter as &mut dyn Iterator<Item = _>
+                } else {
+                    merged_iter = itertools::merge_join_by(local_iter, global_iter, |lhs, rhs| {
+                        lhs.0.cmp(rhs.0)
+                    })
+                    .map(|either| either.into_left());
+                    &mut merged_iter
+                };
+
+                for either in
+                    itertools::merge_join_by(iter, self.special_vars(), |lhs, rhs| lhs.0.cmp(rhs.0))
+                {
+                    match either {
+                        EitherOrBoth::Both((name, var), _) | EitherOrBoth::Left((name, var)) => {
+                            f(name, var)?;
+                        }
+                        EitherOrBoth::Right((name, getter)) => {
+                            let val = getter(self);
+                            f(name, &Variable::from(val))?;
+                        }
+                    }
                 }
             }
             VarScope::Universal => todo!(),
-            VarScope::Auto => {
-                for (name, var) in
-                    itertools::merge_join_by(local_vars, self.global_vars().iter(), |lhs, rhs| {
-                        lhs.0.cmp(rhs.0)
-                    })
-                    .map(|kv| kv.into_left())
-                {
-                    f(name, var)?;
-                }
-            }
         }
         ControlFlow::Continue(())
     }
 
     pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = Variable>> {
+        if let Some(value) = self.get_special_var(name) {
+            struct Id<T>(T);
+            impl<T> Deref for Id<T> {
+                type Target = T;
+                fn deref(&self) -> &Self::Target {
+                    &self.0
+                }
+            }
+
+            return Some(Either::Left(Id(Variable {
+                value,
+                export: false,
+            })));
+        }
+
         match self.local_var_map.get(name) {
-            Some(&idx) => Some(Either::Left(&self.local_vars[idx].as_ref().unwrap().var)),
-            None => self.get_global_var(name).map(Either::Right),
+            Some(&idx) => Some(Either::Right(Either::Left(
+                &self.local_vars[idx].as_ref().unwrap().var,
+            ))),
+            None => self
+                .get_global_var(name)
+                .map(|v| Either::Right(Either::Right(v))),
         }
     }
 

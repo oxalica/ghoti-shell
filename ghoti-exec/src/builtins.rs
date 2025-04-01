@@ -120,6 +120,10 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
         }
         Some((name, vals)) => {
             validate_variable_name(name)?;
+            ensure!(
+                !ctx.has_special_var(name),
+                "cannot modify special variable: {name:?}",
+            );
             let var = Variable {
                 value: vals.to_vec(),
                 export: args.export,

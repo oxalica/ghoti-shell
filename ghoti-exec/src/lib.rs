@@ -2,18 +2,20 @@ use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::ops::{ControlFlow, Deref, DerefMut};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{fmt, io as stdio, mem, slice};
 
 use builtins::FunctionOpts;
-use command::{BoxCommand, Command, ReportResult, UserFunc, UserFuncImpl};
+use command::{BoxCommand, Command, UserFunc, UserFuncImpl};
 use either::Either;
 use ghoti_syntax::{
     self as ast, ParseError, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag, parse_source,
 };
+use io::StdioCollectSink;
 use itertools::EitherOrBoth;
+use tokio::io::AsyncRead;
 use utils::validate_variable_name;
 
 use crate::io::{Io, IoConfig};
@@ -113,7 +115,7 @@ pub enum Error {
     NotOneWord(usize),
     #[error("empty command")]
     EmptyCommand,
-    #[error("command not found: {0:?}")]
+    #[error("command not found: {0}")]
     CommandNotFound(String),
     #[error("variable not found: {0:?}")]
     VariableNotFound(String),
@@ -137,6 +139,8 @@ pub enum Error {
     CloneHandle(stdio::Error),
     #[error("failed to wait process: {0}")]
     WaitProcess(stdio::Error),
+    #[error("cannot change the current directory: {0}")]
+    ChangeCurrentDir(stdio::Error),
     #[error("invalid UTF8")]
     InvalidUtf8,
 }
@@ -167,6 +171,7 @@ impl Error {
             Error::CreatePipe(_) => 1,
             Error::CloneHandle(_) => 1,
             Error::WaitProcess(_) => 1,
+            Error::ChangeCurrentDir(_) => 1,
             Error::InvalidUtf8 => 123,
         })
     }
@@ -366,6 +371,14 @@ pub struct ExecContext<'a> {
 }
 
 #[derive(Debug)]
+struct LocalVar {
+    var: Variable,
+    name: String,
+    scope_idx: usize,
+    shadowed: Option<usize>,
+}
+
+#[derive(Debug)]
 struct SourceFile {
     origin: Option<String>,
     text: String,
@@ -387,11 +400,11 @@ enum FrameKind {
 }
 
 #[derive(Debug)]
-struct LocalVar {
-    var: Variable,
-    name: String,
-    scope_idx: usize,
-    shadowed: Option<usize>,
+pub enum LocateExternalCommand {
+    ExecFile(PathBuf),
+    NotExecFile(PathBuf),
+    Dir(PathBuf),
+    NotFound,
 }
 
 impl Deref for ExecContext<'_> {
@@ -731,6 +744,52 @@ impl<'a> ExecContext<'a> {
         }
     }
 
+    pub fn locate_external_command(&self, name: &str) -> LocateExternalCommand {
+        use rustix::fs::{Access, access};
+
+        // Absolute or relative path.
+        if name.contains("/") {
+            let p = Path::new(name);
+            return match p.metadata() {
+                Ok(m) => {
+                    if m.is_dir() {
+                        LocateExternalCommand::Dir(p.into())
+                    } else if m.is_file() && access(p, Access::EXEC_OK).is_ok() {
+                        LocateExternalCommand::ExecFile(p.into())
+                    } else {
+                        LocateExternalCommand::NotExecFile(p.into())
+                    }
+                }
+                Err(_) => LocateExternalCommand::NotFound,
+            };
+        }
+
+        // Special case.
+        if name == ".." {
+            return LocateExternalCommand::Dir("..".into());
+        }
+
+        // Finally, search for external commands in PATH.
+        if let Some(path) = self.get_var("PATH") {
+            let mut found_file = None;
+            for dir in path.value.iter().flat_map(|s| s.split(':')) {
+                let p = Path::new(dir).join(name);
+                if let Ok(m) = p.metadata() {
+                    if m.is_file() && access(&p, Access::EXEC_OK).is_ok() {
+                        return LocateExternalCommand::ExecFile(p);
+                    }
+                    found_file.get_or_insert(p);
+                }
+            }
+            if let Some(p) = found_file {
+                // No special treatment for directories here.
+                return LocateExternalCommand::NotExecFile(p);
+            }
+        }
+
+        LocateExternalCommand::NotFound
+    }
+
     pub fn enter_local_scope(&mut self) -> impl DerefMut<Target = &mut Self> {
         self.cur_scope_idx += 1;
         scopeguard::guard(self, |this| {
@@ -813,7 +872,7 @@ impl<'a> ExecContext<'a> {
         match stmt {
             Stmt::Command(_pos, words) => {
                 let words = self.expand_words(words).await;
-                self.exec_command(&words).await;
+                tri!(self.exec_command(&words).await);
             }
             Stmt::Block(_pos, stmts) => {
                 // FIXME: Exclude group-only blocks, eg. if conditions.
@@ -998,24 +1057,123 @@ impl<'a> ExecContext<'a> {
         ControlFlow::Continue(())
     }
 
-    pub async fn exec_command(&mut self, words: &[String]) {
-        let Some(cmd) = words.first() else {
-            self.emit_error(Error::EmptyCommand, true).await;
-            return;
-        };
+    pub async fn exec_command(&mut self, words: &[String]) -> ExecResult<()> {
+        let cmd = words.first().ok_or(Error::EmptyCommand)?;
 
         if let Some(cmd) = self.get_func(cmd) {
             cmd.exec(self, words).await;
-            return;
+            return Ok(());
         }
 
-        let args = builtins::CommandArgs {
-            all: false,
-            query: false,
-            search: false,
-            args: words.to_vec(),
+        let exe_path = match self.locate_external_command(cmd) {
+            LocateExternalCommand::ExecFile(path) => path,
+            LocateExternalCommand::Dir(path) => {
+                std::env::set_current_dir(path).map_err(Error::ChangeCurrentDir)?;
+                self.set_last_status(Status::SUCCESS);
+                return Ok(());
+            }
+            LocateExternalCommand::NotExecFile(path) => {
+                return Err(Error::CommandNotFound(format!(
+                    "{} (candidate {} is not an executable file)",
+                    cmd,
+                    path.display(),
+                )));
+            }
+            LocateExternalCommand::NotFound => {
+                return Err(Error::CommandNotFound(cmd.into()));
+            }
         };
-        builtins::command(self, args).await.report(self).await;
+
+        let st = self.exec_external_command(&exe_path, words).await?;
+        self.set_last_status(st);
+        Ok(())
+    }
+
+    pub async fn exec_external_command(
+        &mut self,
+        exe_path: &Path,
+        args_with_0: &[String],
+    ) -> ExecResult<Status> {
+        use std::future::ready;
+
+        async fn copy_stdio_to_sink(
+            rdr: impl AsyncRead + Unpin,
+            sink: StdioCollectSink,
+        ) -> ExecResult<()> {
+            use tokio::io::AsyncBufReadExt;
+
+            let mut stdout = tokio::io::BufReader::new(rdr);
+            loop {
+                let buf = stdout.fill_buf().await.map_err(Error::ReadWrite)?;
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                sink(buf)?;
+                let len = buf.len();
+                stdout.consume(len);
+            }
+        }
+
+        let (mut os_stdin, stdin_sink) = self.io.stdin.to_stdio()?;
+        if stdin_sink.is_some() {
+            os_stdin = std::process::Stdio::null();
+        }
+        let (os_stdout, stdout_sink) = self.io.stdout.to_stdio()?;
+        let (os_stderr, stderr_sink) = self.io.stderr.to_stdio()?;
+
+        let mut child = {
+            let mut builder = tokio::process::Command::new(exe_path);
+            builder
+                .kill_on_drop(true)
+                .arg0(&args_with_0[0])
+                .args(&args_with_0[1..])
+                .stdin(os_stdin)
+                .stdout(os_stdout)
+                .stderr(os_stderr)
+                .env_clear();
+            self.list_vars::<()>(VarScope::Auto, |name, var| {
+                if var.export {
+                    builder.env(name, var.value.join(" "));
+                }
+                ControlFlow::Continue(())
+            });
+            builder
+                .spawn()
+                .map_err(|err| Error::SpawnProcess(exe_path.into(), err))?
+        };
+
+        let mut copy_stdout = Either::Left(ready(ExecResult::Ok(())));
+        let mut copy_stderr = Either::Left(ready(ExecResult::Ok(())));
+        if let Some(sink) = stdout_sink {
+            copy_stdout = Either::Right(copy_stdio_to_sink(child.stdout.take().unwrap(), sink));
+        }
+        if let Some(sink) = stderr_sink {
+            copy_stderr = Either::Right(copy_stdio_to_sink(child.stderr.take().unwrap(), sink));
+        }
+
+        let (ret_wait, ret_stdout, ret_stderr) =
+            tokio::join!(child.wait(), copy_stdout, copy_stderr);
+        ret_stdout?;
+        ret_stderr?;
+        let status = ret_wait.map_err(Error::WaitProcess)?;
+        if status.success() {
+            return Ok(Status::SUCCESS);
+        }
+
+        if let Some(code) = status.code() {
+            return Ok(Status(u8::try_from(code).unwrap_or(u8::MAX)));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                let sig = sig.clamp(0, 128) as u8;
+                return Ok(Status(127 + sig));
+            }
+        }
+
+        unreachable!();
     }
 
     async fn expand_words(&mut self, words: &[ast::Word]) -> Vec<String> {

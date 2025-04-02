@@ -1,17 +1,13 @@
 use std::fmt::Write;
-use std::future::ready;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 
 use clap::Parser;
-use either::Either;
 use owo_colors::AnsiColors;
-use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::command::{self, BoxCommand, UserFunc};
-use crate::io::StdioCollectSink;
 use crate::utils::validate_variable_name;
-use crate::{Error, ExecContext, ExecResult, Status, VarScope, Variable};
+use crate::{Error, ExecContext, ExecResult, LocateExternalCommand, Status, VarScope, Variable};
 
 macro_rules! bail {
     ($($msg:tt)+) => {
@@ -212,86 +208,23 @@ pub struct CommandArgs {
     pub args: Vec<String>,
 }
 
-pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult {
-    async fn copy_stdio_to_sink(
-        rdr: impl AsyncRead + Unpin,
-        sink: StdioCollectSink,
-    ) -> ExecResult<()> {
-        let mut stdout = tokio::io::BufReader::new(rdr);
-        loop {
-            let buf = stdout.fill_buf().await.map_err(Error::ReadWrite)?;
-            if buf.is_empty() {
-                return Ok(());
-            }
-            sink(buf)?;
-            let len = buf.len();
-            stdout.consume(len);
-        }
-    }
-
+pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult<Status> {
     ensure!(!args.all && !args.query && !args.search, "TODO");
-
-    let (cmd, args) = args.args.split_first().ok_or(Error::EmptyCommand)?;
-
-    let io = ctx.io();
-    let (mut os_stdin, stdin_sink) = io.stdin.to_stdio()?;
-    if stdin_sink.is_some() {
-        os_stdin = std::process::Stdio::null();
-    }
-    let (os_stdout, stdout_sink) = io.stdout.to_stdio()?;
-    let (os_stderr, stderr_sink) = io.stderr.to_stdio()?;
-
-    let mut child = {
-        let mut builder = tokio::process::Command::new(cmd);
-        builder
-            .kill_on_drop(true)
-            .args(args)
-            .stdin(os_stdin)
-            .stdout(os_stdout)
-            .stderr(os_stderr)
-            .env_clear();
-        ctx.list_vars::<()>(VarScope::Auto, |name, var| {
-            if var.export {
-                builder.env(name, var.value.join(" "));
-            }
-            ControlFlow::Continue(())
-        });
-        builder
-            .spawn()
-            .map_err(|err| Error::SpawnProcess(cmd.into(), err))?
-    };
-
-    let mut copy_stdout = Either::Left(ready(ExecResult::Ok(())));
-    let mut copy_stderr = Either::Left(ready(ExecResult::Ok(())));
-    if let Some(sink) = stdout_sink {
-        copy_stdout = Either::Right(copy_stdio_to_sink(child.stdout.take().unwrap(), sink));
-    }
-    if let Some(sink) = stderr_sink {
-        copy_stderr = Either::Right(copy_stdio_to_sink(child.stderr.take().unwrap(), sink));
-    }
-
-    let (ret_wait, ret_stdout, ret_stderr) = tokio::join!(child.wait(), copy_stdout, copy_stderr);
-    ret_stdout?;
-    ret_stderr?;
-    let status = ret_wait.map_err(Error::WaitProcess)?;
-    if status.success() {
-        return Ok(Status::SUCCESS);
-    }
-
-    if let Some(code) = status.code() {
-        return Ok(Status(u8::try_from(code).unwrap_or(u8::MAX)));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            let sig = sig.clamp(0, 128) as u8;
-            return Ok(Status(127 + sig));
+    let cmd = args.args.first().ok_or(Error::EmptyCommand)?;
+    let exe_path = match ctx.locate_external_command(cmd) {
+        LocateExternalCommand::ExecFile(path) => path,
+        LocateExternalCommand::NotExecFile(path) | LocateExternalCommand::Dir(path) => {
+            return Err(Error::CommandNotFound(format!(
+                "{} (candidate {} is not an executable file)",
+                cmd,
+                path.display(),
+            )));
         }
-    }
-
-    todo!();
+        LocateExternalCommand::NotFound => {
+            return Err(Error::CommandNotFound(cmd.into()));
+        }
+    };
+    ctx.exec_external_command(&exe_path, &args.args).await
 }
 
 pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<()> {
@@ -539,8 +472,17 @@ pub async fn type_(ctx: &mut ExecContext<'_>, args: TypeArgs) -> ExecResult {
         } else if ctx.get_builtin(name).is_some() {
             writeln!(buf, "{name} is a builtin").unwrap();
         } else {
-            writeln!(buf, "type: cannot find {name:?}").unwrap();
-            failed += 1;
+            match ctx.locate_external_command(name) {
+                LocateExternalCommand::ExecFile(path) => {
+                    writeln!(buf, "{name} is {}", path.display()).unwrap();
+                }
+                LocateExternalCommand::NotExecFile(_)
+                | LocateExternalCommand::Dir(_)
+                | LocateExternalCommand::NotFound => {
+                    writeln!(buf, "type: cannot find {name:?}").unwrap();
+                    failed += 1;
+                }
+            }
         }
     }
 

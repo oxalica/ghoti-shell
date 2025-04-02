@@ -300,15 +300,20 @@ pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<()
 
 #[derive(Debug, Parser)]
 pub struct FunctionsOpts {
-    #[arg(short, exclusive = true)]
+    #[arg(long, short)]
     pub erase: bool,
-    #[arg(short, exclusive = true)]
+    #[arg(long, short)]
     pub query: bool,
 
     pub funcs: Vec<String>,
 }
 
 pub async fn functions(ctx: &mut ExecContext<'_>, args: FunctionsOpts) -> ExecResult {
+    ensure!(
+        args.erase as u8 + args.query as u8 <= 1,
+        "--erase and --query are mutually exclusive",
+    );
+
     if args.erase {
         let fail_cnt = args
             .funcs

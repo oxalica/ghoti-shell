@@ -1,8 +1,6 @@
 use std::fmt::Write;
 use std::future::ready;
 use std::ops::ControlFlow;
-use std::process;
-use std::rc::Rc;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -11,8 +9,9 @@ use owo_colors::AnsiColors;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
 use crate::command::{self, BoxCommand, UserFunc};
+use crate::io::StdioCollectSink;
 use crate::utils::validate_variable_name;
-use crate::{Error, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable};
+use crate::{Error, ExecContext, ExecResult, Status, VarScope, Variable};
 
 macro_rules! bail {
     ($($msg:tt)+) => {
@@ -126,7 +125,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 buf.push('\n');
                 ControlFlow::Continue(())
             });
-            ctx.io().write_stdout(buf).await
+            ctx.io().stdout.write_all(buf).await
         }
         Some((name, vals)) => {
             validate_variable_name(name)?;
@@ -164,7 +163,7 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult
         let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
         names.sort_unstable();
         let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
-        ctx.io().write_stdout(out).await?;
+        ctx.io().stdout.write_all(out).await?;
         Ok(Some(Status::SUCCESS))
     } else if args.query {
         let ok = args.args.iter().any(|name| ctx.get_builtin(name).is_some());
@@ -214,27 +213,14 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
 
     let (cmd, args) = args.args.split_first().ok_or(Error::EmptyCommand)?;
 
-    let cvt_stdio = |s: &Stdio, is_stdin: bool| {
-        Ok::<_, Error>(match s {
-            Stdio::Inherit => (process::Stdio::inherit(), None),
-            Stdio::Close => todo!(),
-            Stdio::Collect(sink) => {
-                if is_stdin {
-                    todo!();
-                }
-                (process::Stdio::piped(), Some(Rc::clone(sink)))
-            }
-            Stdio::Raw(raw) => (
-                (**raw).try_clone().map_err(Error::CloneHandle)?.into(),
-                None,
-            ),
-        })
-    };
-
     let io = ctx.io();
-    let (os_stdin, _) = cvt_stdio(&io.stdin, true)?;
-    let (os_stdout, stdout_sink) = cvt_stdio(&io.stdout, false)?;
-    let (os_stderr, stderr_sink) = cvt_stdio(&io.stderr, false)?;
+    let (mut os_stdin, stdin_sink) = io.stdin.to_stdio()?;
+    if stdin_sink.is_some() {
+        os_stdin = std::process::Stdio::null();
+    }
+    let (os_stdout, stdout_sink) = io.stdout.to_stdio()?;
+    let (os_stderr, stderr_sink) = io.stderr.to_stdio()?;
+
     let mut child = {
         let mut builder = tokio::process::Command::new(cmd);
         builder
@@ -289,21 +275,26 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
 }
 
 pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<()> {
-    let Some((path, args)) = args[1..].split_first() else {
-        return Err(Error::Custom("TODO: source from stdin".into()));
+    let (path, text, args) = match args[1..].split_first() {
+        Some((path, args)) => {
+            let text = tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || std::fs::read_to_string(path)
+            })
+            .await
+            .expect("no panic")
+            .map_err(Error::ReadWrite)?;
+            (path.clone(), text, args)
+        }
+        None => {
+            let text = ctx.io().stdin.read_to_string().await?;
+            ("<stdin>".into(), text, &[][..])
+        }
     };
-
-    let text = tokio::task::spawn_blocking({
-        let path = path.clone();
-        move || std::fs::read_to_string(path)
-    })
-    .await
-    .expect("no panic")
-    .map_err(Error::ReadWrite)?;
 
     let scope = &mut **ctx.enter_local_scope();
     scope.set_var("argv", VarScope::Local, args.to_vec());
-    scope.exec_source(Some(path.clone()), text).await;
+    scope.exec_source(Some(path), text).await;
     Ok(())
 }
 
@@ -343,7 +334,7 @@ pub async fn functions(ctx: &mut ExecContext<'_>, args: FunctionsOpts) -> ExecRe
                 fail_cnt += 1;
             }
         }
-        let _: ExecResult<_> = ctx.io().write_stdout(buf).await;
+        let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
         Ok(fail_cnt.into())
     }
 }
@@ -461,7 +452,7 @@ pub async fn set_color(ctx: &mut ExecContext<'_>, args: SetColorOpts) -> ExecRes
 
     let s = format!("{reset}{}", s.prefix_formatter());
     if !s.is_empty() {
-        let _: ExecResult<_> = ctx.io().write_stdout(s).await;
+        let _: ExecResult<_> = ctx.io().stdout.write_all(s).await;
         Ok(Status::SUCCESS)
     } else {
         Ok(Status::FAILURE)

@@ -1,12 +1,11 @@
 use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{self, Write as _};
 use std::ops::{ControlFlow, Deref, DerefMut};
-use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::{fmt, mem, slice};
+use std::sync::Arc;
+use std::{fmt, io as stdio, mem, slice};
 
 use builtins::FunctionOpts;
 use command::{BoxCommand, Command, ReportResult, UserFunc, UserFuncImpl};
@@ -17,10 +16,12 @@ use ghoti_syntax::{
 use itertools::EitherOrBoth;
 use utils::validate_variable_name;
 
+use crate::io::{Io, IoConfig};
 use crate::utils::validate_function_name;
 
 pub mod builtins;
 pub mod command;
+pub mod io;
 mod utils;
 
 #[cfg(test)]
@@ -123,23 +124,21 @@ pub enum Error {
 
     // System errors.
     #[error("read/write error: {0}")]
-    ReadWrite(io::Error),
+    ReadWrite(stdio::Error),
     #[error("failed open redirection file {0:?}: {1}")]
-    OpenRedirectionFile(PathBuf, io::Error),
+    OpenRedirectionFile(PathBuf, stdio::Error),
     #[error("failed to spawn process {0:?}: {1}")]
-    SpawnProcess(PathBuf, io::Error),
+    SpawnProcess(PathBuf, stdio::Error),
     #[error("pipe closed")]
     PipeClosed,
     #[error("failed to create pipe: {0}")]
-    CreatePipe(io::Error),
+    CreatePipe(stdio::Error),
     #[error("failed to clone fd: {0}")]
-    CloneHandle(io::Error),
+    CloneHandle(stdio::Error),
     #[error("failed to wait process: {0}")]
-    WaitProcess(io::Error),
-
-    // TODO
-    #[error("invalid UTF8 in {0}")]
-    InvalidUtf8(String),
+    WaitProcess(stdio::Error),
+    #[error("invalid UTF8")]
+    InvalidUtf8,
 }
 
 impl From<String> for Error {
@@ -168,59 +167,8 @@ impl Error {
             Error::CreatePipe(_) => 1,
             Error::CloneHandle(_) => 1,
             Error::WaitProcess(_) => 1,
-            Error::InvalidUtf8(_) => 123,
+            Error::InvalidUtf8 => 123,
         })
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct Io {
-    pub stdin: Stdio,
-    pub stdout: Stdio,
-    pub stderr: Stdio,
-}
-
-pub type StdioCollectSink = Rc<dyn Fn(&[u8]) -> ExecResult>;
-
-#[derive(Default, Clone)]
-pub enum Stdio {
-    #[default]
-    Inherit,
-    Close,
-    Collect(StdioCollectSink),
-    Raw(Rc<OwnedFd>),
-}
-
-impl fmt::Debug for Stdio {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Inherit => write!(f, "Inherit"),
-            Self::Close => write!(f, "Close"),
-            Self::Collect(_) => f.debug_tuple("Collect").finish_non_exhaustive(),
-            Self::Raw(fd) => f.debug_tuple("Raw").field(fd).finish(),
-        }
-    }
-}
-
-impl Io {
-    pub async fn write_stdout(&self, bytes: impl AsRef<[u8]> + Send + 'static) -> ExecResult {
-        match &self.stdout {
-            Stdio::Close => Err(Error::PipeClosed),
-            Stdio::Collect(sink) => sink(bytes.as_ref()),
-            // FIXME: Should bypass std's lock to avoid deadlocks when using print* macros.
-            Stdio::Inherit => {
-                tokio::task::spawn_blocking(move || {
-                    let mut lock = std::io::stdout().lock();
-                    lock.write_all(bytes.as_ref())?;
-                    lock.flush()
-                })
-                .await
-                .expect("no panic")
-                .map_err(Error::ReadWrite)?;
-                Ok(Status::SUCCESS)
-            }
-            Stdio::Raw(_) => todo!(),
-        }
     }
 }
 
@@ -410,7 +358,7 @@ pub struct ExecContext<'a> {
     outer: Option<&'a ExecContext<'a>>,
     last_status: Status,
     last_pipe_status: Vec<Status>,
-    io: Io,
+    io: IoConfig,
 
     backtrace: Vec<FrameInfo>,
 }
@@ -462,7 +410,7 @@ impl<'a> ExecContext<'a> {
             outer: None,
             last_status: Status::SUCCESS,
             last_pipe_status: Vec::new(),
-            io: Io::default(),
+            io: IoConfig::default(),
 
             backtrace: Vec::new(),
         }
@@ -488,7 +436,7 @@ impl<'a> ExecContext<'a> {
         &self.last_pipe_status
     }
 
-    pub fn io(&self) -> &Io {
+    pub fn io(&self) -> &IoConfig {
         &self.io
     }
 
@@ -572,7 +520,7 @@ impl<'a> ExecContext<'a> {
 
     pub async fn emit_error(&mut self, err: Error, set_status: bool) {
         let msg = self.render_error(&err);
-        let _: ExecResult<_> = self.io().write_stdout(msg).await;
+        let _: ExecResult<_> = self.io().stderr.write_all(msg).await;
         if set_status {
             self.set_last_status(err.to_status());
         }
@@ -973,7 +921,7 @@ impl<'a> ExecContext<'a> {
                         opt.open(file_path)
                             .map_err(|err| Error::OpenRedirectionFile(file_path.into(), err))
                     );
-                    let f = Stdio::Raw(Rc::new(OwnedFd::from(f)));
+                    let f = Io::File(Arc::new(f));
 
                     match redir.port {
                         RedirectPort::STDIN => this.io.stdin = f,
@@ -1006,29 +954,19 @@ impl<'a> ExecContext<'a> {
                     };
                     let mut subctx = ExecContext::new_inside(self, frame());
                     for (lhs, port) in pipes {
-                        let (pipe_r, pipe_w) = match os_pipe::pipe().map_err(Error::CreatePipe) {
-                            Ok(v) => v,
-                            Err(err) => {
-                                drop(tasks);
-                                self.emit_error(err, true).await;
-                                return ControlFlow::Continue(());
-                            }
-                        };
-                        let pipe_r = Stdio::Raw(Rc::new(pipe_r.into()));
-                        let pipe_w = Stdio::Raw(Rc::new(pipe_w.into()));
-
+                        let (tx, rx) = tri!(subctx, Io::new_os_pipe());
                         match *port {
-                            RedirectPort::STDOUT => subctx.io.stdout = pipe_w,
-                            RedirectPort::STDERR => subctx.io.stderr = pipe_w,
+                            RedirectPort::STDOUT => subctx.io.stdout = tx,
+                            RedirectPort::STDERR => subctx.io.stderr = tx,
                             RedirectPort::STDOUT_STDERR => {
-                                (subctx.io.stdout, subctx.io.stderr) = (pipe_w.clone(), pipe_w)
+                                (subctx.io.stdout, subctx.io.stderr) = (tx.clone(), tx)
                             }
                             _ => todo!(),
                         }
                         tasks.push(task(subctx, lhs));
 
                         subctx = ExecContext::new_inside(self, frame());
-                        subctx.io.stdin = pipe_r;
+                        subctx.io.stdin = rx;
                     }
                     tasks.push(task(subctx, last));
 
@@ -1166,7 +1104,7 @@ impl<'a> ExecContext<'a> {
                         let buf = Rc::new(RefCell::new(Vec::new()));
                         let buf_weak = Rc::downgrade(&buf);
                         // FIXME: Avoid double Rc?
-                        let io_collect = Stdio::Collect(Rc::new(move |bytes| {
+                        let io_collect = Io::Collect(Rc::new(move |bytes| {
                             buf_weak
                                 .upgrade()
                                 .ok_or(Error::PipeClosed)?

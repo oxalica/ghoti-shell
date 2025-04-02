@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
 
-use crate::{ExecContext, Executor, Status, Stdio};
+use crate::{ExecContext, Executor, Io, Status};
 
 #[tokio::test]
 async fn var_scopes() {
@@ -10,7 +10,7 @@ async fn var_scopes() {
     let mut ctx = ExecContext::new(&exec);
     let buf = Rc::new(RefCell::new(String::new()));
     let buf2 = Rc::clone(&buf);
-    ctx.io.stdout = Stdio::Collect(Rc::new(move |bytes| {
+    ctx.io.stdout = Io::Collect(Rc::new(move |bytes| {
         buf2.borrow_mut()
             .push_str(std::str::from_utf8(bytes).unwrap());
         Ok(Status::SUCCESS)

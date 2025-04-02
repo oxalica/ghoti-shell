@@ -250,6 +250,8 @@ impl Default for Executor {
             .extend(builtins::all_builtins().map(|(name, cmd)| (name.to_owned(), cmd)));
 
         this.set_special_var("status", |ctx| vec![ctx.last_status().to_string()]);
+        // TODO?
+        this.set_special_var("status_generation", |_ctx| vec!["0".into()]);
         this.set_special_var("pipestatus", |ctx| {
             ctx.last_pipe_status()
                 .iter()

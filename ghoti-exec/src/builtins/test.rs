@@ -112,6 +112,8 @@ fn eval_atom<'i>(iter: &mut Peekable<impl Iterator<Item = &'i str>>) -> ExecResu
                 "-gt" => |a: &_, b: &_| num_lt(b, a),
                 "-ge" => |a: &_, b: &_| !num_lt(a, b),
                 "-le" => |a: &_, b: &_| !num_lt(b, a),
+                "=" => str_eq,
+                "!=" => |a: &_, b: &_| !str_eq(a, b),
                 op => bail!("expecting a binary op but got {op:?}"),
             };
             let snd = iter
@@ -203,6 +205,10 @@ fn fd_is_tty(fd: &str) -> bool {
 
 fn str_is_empty(s: &str) -> bool {
     s.is_empty()
+}
+
+fn str_eq(a: &str, b: &str) -> bool {
+    a == b
 }
 
 fn num_eq(a: &str, b: &str) -> bool {

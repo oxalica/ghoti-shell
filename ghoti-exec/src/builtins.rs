@@ -41,6 +41,8 @@ pub fn all_builtins() -> impl ExactSizeIterator<Item = (&'static str, BoxCommand
         ("test", Box::new(command::raw_builtin(test::test))),
         ("functions", Box::new(command::parsed_builtin(functions))),
         ("set_color", Box::new(command::parsed_builtin(set_color))),
+        ("echo", Box::new(command::raw_builtin(echo))),
+        ("type", Box::new(command::parsed_builtin(type_))),
     ]
     .into_iter()
 }
@@ -66,19 +68,26 @@ pub struct SetArgs {
     #[arg(long, short = 'x')]
     export: bool,
 
-    #[arg(long, short = 'e')]
+    #[arg(long, short)]
     erase: bool,
+    #[arg(long, short)]
+    query: bool,
 
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
-pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
+pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult<Option<Status>> {
     let scope_flag_cnt = [args.local, args.function, args.global, args.universal]
         .iter()
         .map(|&b| b as u8)
         .sum::<u8>();
     ensure!(scope_flag_cnt <= 1, "scope flags are mutually exclusive");
+    ensure!(
+        args.erase as u8 + args.query as u8 <= 1,
+        "--erase and --query are mutually exclusive",
+    );
+
     let scope = if args.local {
         VarScope::Local
     } else if args.function {
@@ -91,17 +100,27 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
         VarScope::Auto
     };
 
+    if args.query {
+        let mut fail_cnt = 0usize;
+        for name in &args.args {
+            ensure!(scope == VarScope::Auto, "TODO");
+            if ctx.get_var(name).is_none() {
+                fail_cnt += 1;
+            }
+        }
+        return Ok(Some(fail_cnt.into()));
+    }
     if args.erase {
         for name in &args.args {
             validate_variable_name(name)?;
         }
-        let mut ok = true;
+        let mut fail_cnt = 0usize;
         for name in &args.args {
             if !ctx.remove_var(scope, name) {
-                ok = false;
+                fail_cnt += 1;
             }
         }
-        return Ok(ok.into());
+        return Ok(Some(fail_cnt.into()));
     }
 
     match args.args.split_first() {
@@ -125,7 +144,8 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 buf.push('\n');
                 ControlFlow::Continue(())
             });
-            ctx.io().stdout.write_all(buf).await
+            let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
+            Ok(Some(Status::SUCCESS))
         }
         Some((name, vals)) => {
             validate_variable_name(name)?;
@@ -138,7 +158,7 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult {
                 export: args.export,
             };
             ctx.set_var(name, scope, var);
-            Ok(ctx.last_status())
+            Ok(None)
         }
     }
 }
@@ -462,4 +482,68 @@ pub async fn set_color(ctx: &mut ExecContext<'_>, args: SetColorOpts) -> ExecRes
     } else {
         Ok(Status::FAILURE)
     }
+}
+
+pub async fn echo(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult {
+    let mut newline = true;
+    let mut unescape = false;
+    let mut space = true;
+
+    let mut iter = args[1..].iter();
+    let mut buf = String::new();
+    let mut first = true;
+    for el in iter.by_ref() {
+        match &**el {
+            "-n" => newline = false,
+            "-s" => space = false,
+            "-E" => unescape = false,
+            "-e" => unescape = true,
+            "--" => break,
+            _ => {
+                buf.push_str(el);
+                first = false;
+                break;
+            }
+        }
+    }
+
+    for el in iter {
+        if first {
+            first = false;
+        } else if space {
+            buf.push(' ');
+        }
+        buf.push_str(el);
+    }
+    if newline {
+        buf.push('\n');
+    }
+
+    ensure!(!unescape, "TODO");
+
+    ctx.io().stdout.write_all(buf).await
+}
+
+#[derive(Debug, Parser)]
+pub struct TypeArgs {
+    pub names: Vec<String>,
+}
+
+pub async fn type_(ctx: &mut ExecContext<'_>, args: TypeArgs) -> ExecResult {
+    let mut buf = String::new();
+    let mut failed = 0usize;
+    for name in &args.names {
+        if ctx.get_global_func(name).is_some() {
+            // TODO: function source
+            writeln!(buf, "{name} is a function").unwrap();
+        } else if ctx.get_builtin(name).is_some() {
+            writeln!(buf, "{name} is a builtin").unwrap();
+        } else {
+            writeln!(buf, "type: cannot find {name:?}").unwrap();
+            failed += 1;
+        }
+    }
+
+    let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
+    Ok(failed.into())
 }

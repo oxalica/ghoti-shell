@@ -1,13 +1,12 @@
 use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::rc::Rc;
 
 use ghoti_syntax::Stmt;
 
-use crate::{Error, ExecBreak, ExecContext, Status, VarScope};
+use crate::{Error, ExecContext, Status, VarScope};
 
 pub type BoxCommand = Box<dyn Command>;
 
@@ -26,7 +25,7 @@ pub trait Command: Any + fmt::Debug + dyn_clone::DynClone + 'static {
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-    ) -> BoxFuture<'fut, Status>;
+    ) -> BoxFuture<'fut, ()>;
 
     fn description(&self) -> Option<&str> {
         None
@@ -37,47 +36,44 @@ dyn_clone::clone_trait_object!(Command);
 
 #[expect(async_fn_in_trait, reason = "we accept !Send")]
 pub trait ReportResult {
-    async fn report(self, ctx: &mut ExecContext<'_>) -> Status;
+    async fn report(self, ctx: &mut ExecContext<'_>);
 }
 
 impl ReportResult for () {
-    async fn report(self, _ctx: &mut ExecContext<'_>) -> Status {
-        Status::SUCCESS
-    }
+    async fn report(self, _ctx: &mut ExecContext<'_>) {}
 }
 
 impl ReportResult for bool {
-    async fn report(self, _ctx: &mut ExecContext<'_>) -> Status {
-        Status::from(self)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct UnchangedStatus;
-
-impl ReportResult for UnchangedStatus {
-    async fn report(self, ctx: &mut ExecContext<'_>) -> Status {
-        ctx.last_status()
+    async fn report(self, ctx: &mut ExecContext<'_>) {
+        ctx.set_last_status(Status::from(self))
     }
 }
 
 impl ReportResult for Status {
-    async fn report(self, _ctx: &mut ExecContext<'_>) -> Status {
-        self
+    async fn report(self, ctx: &mut ExecContext<'_>) {
+        ctx.set_last_status(self);
     }
 }
 
 impl ReportResult for Error {
-    async fn report(self, ctx: &mut ExecContext<'_>) -> Status {
-        ctx.emit_error(self).await
+    async fn report(self, ctx: &mut ExecContext<'_>) {
+        ctx.emit_error(self, true).await;
     }
 }
 
 impl<T: ReportResult, E: ReportResult> ReportResult for Result<T, E> {
-    async fn report(self, ctx: &mut ExecContext<'_>) -> Status {
+    async fn report(self, ctx: &mut ExecContext<'_>) {
         match self {
             Ok(v) => v.report(ctx).await,
             Err(e) => e.report(ctx).await,
+        }
+    }
+}
+
+impl<T: ReportResult> ReportResult for Option<T> {
+    async fn report(self, ctx: &mut ExecContext<'_>) {
+        if let Some(v) = self {
+            v.report(ctx).await;
         }
     }
 }
@@ -115,7 +111,7 @@ where
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-    ) -> BoxFuture<'fut, Status> {
+    ) -> BoxFuture<'fut, ()> {
         Box::pin(async move { (self.func)(ctx, args).await.report(ctx).await })
     }
 }
@@ -165,12 +161,12 @@ where
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-    ) -> BoxFuture<'fut, Status> {
+    ) -> BoxFuture<'fut, ()> {
         let ret = <Args as clap::Parser>::try_parse_from(args);
         Box::pin(async move {
             match ret {
                 Ok(parsed) => (self.func)(ctx, parsed).await.report(ctx).await,
-                Err(err) => ctx.emit_error(Error::InvalidOptions(err)).await,
+                Err(err) => ctx.emit_error(Error::InvalidOptions(err), true).await,
             }
         })
     }
@@ -206,16 +202,11 @@ impl Command for UserFunc {
         &'fut self,
         ctx: &'fut mut ExecContext<'_>,
         args: &'fut [String],
-    ) -> BoxFuture<'fut, Status> {
+    ) -> BoxFuture<'fut, ()> {
         Box::pin(async move {
             let mut subctx = ExecContext::new_inside(ctx);
             subctx.set_var("argv", VarScope::Local, args[1..].to_vec());
-            let ctl = subctx.exec_stmt(&self.0.0).await;
-            match ctl {
-                ControlFlow::Continue(()) => Status::SUCCESS,
-                ControlFlow::Break(ExecBreak::FuncReturn(st)) => st,
-                ControlFlow::Break(_) => unreachable!(),
-            }
+            subctx.exec_stmt(&self.0.0).await;
         })
     }
 

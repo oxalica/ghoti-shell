@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use annotate_snippets::{Level, Renderer, Snippet};
-use ghoti_exec::{ExecBreak, ExecContext, Status};
+use ghoti_exec::{ExecContext, Status};
 use ghoti_syntax::parse_source;
 use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
@@ -81,7 +81,10 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
 
         let input = match rl.readline(&prompt) {
             Ok(input) => input,
-            Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Eof) => {
+                ctx.set_last_status(Status::SUCCESS);
+                return Ok(());
+            }
             Err(ReadlineError::Interrupted) => continue,
             Err(err) => return Err(err.into()),
         };
@@ -103,13 +106,8 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
             }
         };
 
-        let ctl = rt.block_on(ctx.exec_source(&src));
+        rt.block_on(ctx.exec_source(&src));
         // Prevent next prompt from clobbering the output if it contains no newline.
         println!();
-
-        if let ControlFlow::Break(ExecBreak::FuncReturn(st)) = ctl {
-            ctx.set_last_status(st);
-        }
     }
-    Ok(())
 }

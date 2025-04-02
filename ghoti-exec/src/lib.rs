@@ -73,13 +73,19 @@ impl From<bool> for Status {
     }
 }
 
+impl std::process::Termination for Status {
+    fn report(self) -> std::process::ExitCode {
+        self.0.into()
+    }
+}
+
 type ExecControlFlow = ControlFlow<ExecBreak>;
 
-#[derive(Debug, Clone)]
-pub enum ExecBreak {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecBreak {
     LoopBreak,
     LoopContinue,
-    FuncReturn(Status),
+    Return,
 }
 
 pub type Value = String;
@@ -446,12 +452,13 @@ impl<'a> ExecContext<'a> {
         std::iter::successors(Some(self), |ctx| ctx.outer)
     }
 
-    pub async fn emit_error(&mut self, err: Error) -> Status {
+    pub async fn emit_error(&mut self, err: Error, set_status: bool) {
         // TODO: Backtrace.
         let _: ExecResult<_> = self.io().write_stdout(format!("{err}\n")).await;
         let st = err.to_status();
-        self.set_last_status(st);
-        st
+        if set_status {
+            self.set_last_status(st);
+        }
     }
 
     pub fn list_funcs<B>(
@@ -679,11 +686,12 @@ impl<'a> ExecContext<'a> {
         })
     }
 
-    pub async fn exec_source(&mut self, src: &SourceFile) -> ExecControlFlow {
+    pub async fn exec_source(&mut self, src: &SourceFile) {
         for stmt in &src.stmts {
-            self.exec_stmt(stmt).await?;
+            if self.exec_stmt(stmt).await.is_break() {
+                break;
+            }
         }
-        ControlFlow::Continue(())
     }
 
     async fn exec_stmt(&mut self, stmt: &Stmt) -> ExecControlFlow {
@@ -696,7 +704,7 @@ impl<'a> ExecContext<'a> {
                 bail!(self, $err)
             };
             ($this:expr, $err:expr) => {{
-                $this.emit_error($err).await;
+                $this.emit_error($err, true).await;
                 return ControlFlow::Continue(());
             }};
         }
@@ -741,7 +749,7 @@ impl<'a> ExecContext<'a> {
                 match self.exec_stmt(body).await {
                     ControlFlow::Break(ExecBreak::LoopContinue) => {}
                     ControlFlow::Break(ExecBreak::LoopBreak) => break,
-                    ctl => return ctl,
+                    ctl => ctl?,
                 }
             },
             Stmt::For(_pos, var, elem_ws, body) => {
@@ -789,7 +797,8 @@ impl<'a> ExecContext<'a> {
                         }
                     }
                 };
-                return ControlFlow::Break(ExecBreak::FuncReturn(st));
+                self.set_last_status(st);
+                return ControlFlow::Break(ExecBreak::Return);
             }
             Stmt::Redirect(_pos, stmt, redirects) => {
                 let prev_io = self.io().clone();
@@ -848,7 +857,7 @@ impl<'a> ExecContext<'a> {
                             Ok(v) => v,
                             Err(err) => {
                                 drop(tasks);
-                                self.emit_error(err).await;
+                                self.emit_error(err, true).await;
                                 return ControlFlow::Continue(());
                             }
                         };
@@ -898,13 +907,12 @@ impl<'a> ExecContext<'a> {
 
     pub async fn exec_command(&mut self, words: &[String]) {
         let Some(cmd) = words.first() else {
-            self.emit_error(Error::EmptyCommand).await;
+            self.emit_error(Error::EmptyCommand, true).await;
             return;
         };
 
         if let Some(cmd) = self.get_func(cmd) {
-            let st = cmd.exec(self, words).await;
-            self.set_last_status(st);
+            cmd.exec(self, words).await;
             return;
         }
 
@@ -914,8 +922,7 @@ impl<'a> ExecContext<'a> {
             search: false,
             args: words.to_vec(),
         };
-        let st = builtins::command(self, args).await.report(self).await;
-        self.set_last_status(st);
+        builtins::command(self, args).await.report(self).await;
     }
 
     async fn expand_words(&mut self, words: &[ast::Word]) -> Vec<String> {
@@ -983,7 +990,7 @@ impl<'a> ExecContext<'a> {
                         Some(var) => &var.value[..],
                         None => {
                             drop(var);
-                            self.emit_error(Error::VariableNotFound(var_name.into()))
+                            self.emit_error(Error::VariableNotFound(var_name.into()), false)
                                 .await;
                             &[]
                         }

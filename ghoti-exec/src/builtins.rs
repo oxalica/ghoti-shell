@@ -11,11 +11,9 @@ use ghoti_syntax::parse_source;
 use owo_colors::AnsiColors;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
-use crate::command::{self, BoxCommand, UnchangedStatus, UserFunc};
+use crate::command::{self, BoxCommand, UserFunc};
 use crate::utils::validate_variable_name;
-use crate::{
-    Error, ExecBreak, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable,
-};
+use crate::{Error, ExecContext, ExecResult, Status, Stdio, StdioCollectSink, VarScope, Variable};
 
 macro_rules! bail {
     ($($msg:tt)+) => {
@@ -158,7 +156,7 @@ pub struct BuiltinArgs {
     args: Vec<String>,
 }
 
-pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult {
+pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult<Option<Status>> {
     ensure!(
         !(args.names && args.query),
         "--names and --query are mutually exclusive"
@@ -167,17 +165,19 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult
         let mut names = ctx.builtins().map(|(name, _)| name).collect::<Vec<_>>();
         names.sort_unstable();
         let out = names.iter().flat_map(|&s| [s, "\n"]).collect::<String>();
-        ctx.io().write_stdout(out).await
+        ctx.io().write_stdout(out).await?;
+        Ok(Some(Status::SUCCESS))
     } else if args.query {
         let ok = args.args.iter().any(|name| ctx.get_builtin(name).is_some());
-        Ok(ok.into())
+        Ok(Some(ok.into()))
     } else {
         ensure!(!args.args.is_empty(), "missing builtin name");
         let name = &args.args[0];
         let cmd = ctx
             .get_builtin(name)
             .ok_or_else(|| Error::CommandNotFound(name.into()))?;
-        Ok(cmd.exec(ctx, &args.args).await)
+        cmd.exec(ctx, &args.args).await;
+        Ok(None)
     }
 }
 
@@ -289,7 +289,7 @@ pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult
     todo!();
 }
 
-pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<UnchangedStatus> {
+pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<()> {
     let Some((path, args)) = args[1..].split_first() else {
         return Err(Error::Custom("TODO: source from stdin".into()));
     };
@@ -306,13 +306,8 @@ pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<Un
 
     let scope = &mut **ctx.enter_local_scope();
     scope.set_var("argv", VarScope::Local, args.to_vec());
-    match scope.exec_source(&source).await {
-        ControlFlow::Continue(()) => {}
-        ControlFlow::Break(ExecBreak::FuncReturn(n)) => scope.set_last_status(n),
-        _ => unreachable!(),
-    }
-
-    ExecResult::Ok(UnchangedStatus)
+    scope.exec_source(&source).await;
+    Ok(())
 }
 
 #[derive(Debug, Parser)]

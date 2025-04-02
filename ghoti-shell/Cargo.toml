@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 annotate-snippets = "0.11.5"
+clap = { version = "4.5", features = ["derive"] }
 ghoti-exec.path = "../ghoti-exec"
 ghoti-syntax.path = "../ghoti-syntax"
 owo-colors = "4.2.0"

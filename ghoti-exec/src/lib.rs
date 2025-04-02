@@ -98,7 +98,7 @@ pub type ValueList = Vec<String>;
 ///
 /// Typically, it will not break the execution but only print a message and set a non-zero status
 /// code.
-/// [`ExecContext::emit_error`] can be used to report it with backtrace and get a coresponding
+/// [`ExecContext::emit_error`] can be used to report it with backtrace and get a corresponding
 /// [`ExitStatus`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

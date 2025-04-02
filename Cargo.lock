@@ -365,6 +365,7 @@ dependencies = [
 name = "ghoti-exec"
 version = "0.1.0"
 dependencies = [
+ "annotate-snippets",
  "clap",
  "dyn-clone",
  "either",
@@ -383,10 +384,8 @@ dependencies = [
 name = "ghoti-shell"
 version = "0.1.0"
 dependencies = [
- "annotate-snippets",
  "clap",
  "ghoti-exec",
- "ghoti-syntax",
  "owo-colors",
  "rustyline",
  "tokio",

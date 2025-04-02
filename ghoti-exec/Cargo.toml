@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+annotate-snippets = "0.11.5"
 clap = { version = "4.5.34", default-features = false, features = ["derive", "std"] }
 dyn-clone = "1.0.19"
 either = "1.15.0"

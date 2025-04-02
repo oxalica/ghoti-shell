@@ -1,18 +1,18 @@
 use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::{fmt, slice};
+use std::{fmt, mem, slice};
 
 use builtins::FunctionOpts;
-use command::{BoxCommand, Command, ReportResult};
+use command::{BoxCommand, Command, ReportResult, UserFunc, UserFuncImpl};
 use either::Either;
 use ghoti_syntax::{
-    self as ast, RedirectDest, RedirectMode, RedirectPort, SourceFile, Stmt, WordFrag,
+    self as ast, ParseError, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag, parse_source,
 };
 use itertools::EitherOrBoth;
 use utils::validate_variable_name;
@@ -118,6 +118,8 @@ pub enum Error {
     VariableNotFound(String),
     #[error("cannot modify special variable: {0:?}")]
     ModifySpecialVariable(String),
+    #[error("syntax error: {}", .0.kind)]
+    SyntaxError(ParseError),
 
     // System errors.
     #[error("read/write error: {0}")]
@@ -148,8 +150,26 @@ impl From<String> for Error {
 
 impl Error {
     pub fn to_status(&self) -> Status {
-        // TODO
-        Status::FAILURE
+        Status(match self {
+            Error::Custom(_) => 1,
+            Error::InvalidOptions(_) => 121,
+            Error::InvalidIdentifier(_) => 2,
+            Error::InvalidInteger(_) => 2,
+            Error::NotOneWord(_) => 121,
+            Error::EmptyCommand => 123,
+            Error::CommandNotFound(_) => 127,
+            Error::VariableNotFound(_) => 1,
+            Error::ModifySpecialVariable(_) => 1,
+            Error::SyntaxError(_) => 127,
+            Error::SpawnProcess(..) => 125,
+            Error::ReadWrite(_) => 1,
+            Error::OpenRedirectionFile(..) => 1,
+            Error::PipeClosed => 1,
+            Error::CreatePipe(_) => 1,
+            Error::CloneHandle(_) => 1,
+            Error::WaitProcess(_) => 1,
+            Error::InvalidUtf8(_) => 123,
+        })
     }
 }
 
@@ -259,6 +279,7 @@ pub struct Executor {
 
     /// Special read-only variables implemented as getters.
     special_vars: BTreeMap<String, Box<DynSpecialVarGetter>>,
+    error_renderer: annotate_snippets::Renderer,
 }
 
 impl std::fmt::Debug for Executor {
@@ -275,6 +296,8 @@ impl std::fmt::Debug for Executor {
 impl Default for Executor {
     fn default() -> Self {
         let mut this = Self::new();
+        this.error_renderer = annotate_snippets::Renderer::styled();
+
         this.builtin_funcs
             .extend(builtins::all_builtins().map(|(name, cmd)| (name.to_owned(), cmd)));
 
@@ -297,6 +320,7 @@ impl Executor {
             global_funcs: RefCell::new(BTreeMap::new()),
             global_vars: RefCell::new(BTreeMap::new()),
             special_vars: BTreeMap::new(),
+            error_renderer: annotate_snippets::Renderer::plain(),
         }
     }
 
@@ -387,6 +411,29 @@ pub struct ExecContext<'a> {
     last_status: Status,
     last_pipe_status: Vec<Status>,
     io: Io,
+
+    backtrace: Vec<FrameInfo>,
+}
+
+#[derive(Debug)]
+struct SourceFile {
+    origin: Option<String>,
+    text: String,
+}
+
+#[derive(Debug)]
+struct FrameInfo {
+    kind: FrameKind,
+    source: Rc<SourceFile>,
+    pos: u32,
+}
+
+#[derive(Debug)]
+enum FrameKind {
+    Function { name: String, def_pos: u32 },
+    Source,
+    Pipe { def_pos: u32 },
+    CommandSubst { def_pos: u32 },
 }
 
 #[derive(Debug)]
@@ -416,20 +463,17 @@ impl<'a> ExecContext<'a> {
             last_status: Status::SUCCESS,
             last_pipe_status: Vec::new(),
             io: Io::default(),
+
+            backtrace: Vec::new(),
         }
     }
 
-    pub fn new_inside(outer: &'a ExecContext<'a>) -> Self {
-        Self {
-            local_var_map: BTreeMap::new(),
-            local_vars: Vec::new(),
-            cur_scope_idx: 0,
-            root: outer.root,
-            outer: Some(outer),
-            last_status: Status::SUCCESS,
-            last_pipe_status: Vec::new(),
-            io: outer.io.clone(),
-        }
+    pub(crate) fn new_inside(outer: &'a ExecContext<'a>, frame: FrameInfo) -> Self {
+        let mut this = Self::new(outer.root);
+        this.outer = Some(outer);
+        this.io = outer.io.clone();
+        this.backtrace.push(frame);
+        this
     }
 
     pub fn last_status(&self) -> Status {
@@ -448,16 +492,89 @@ impl<'a> ExecContext<'a> {
         &self.io
     }
 
-    pub fn backtrace(&self) -> impl Iterator<Item = &Self> {
+    pub fn backtrace_context(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |ctx| ctx.outer)
     }
 
+    fn backtrace(&self) -> impl Iterator<Item = &FrameInfo> {
+        self.backtrace_context()
+            .flat_map(|ctx| ctx.backtrace.iter().rev())
+    }
+
+    fn render_error(&self, err: &Error) -> String {
+        use annotate_snippets::{Level, Snippet};
+        use std::fmt::Write;
+
+        let err_str = err.to_string();
+        let mut msg = Level::Error.title(&err_str);
+        let first_note;
+
+        let mut iter = self.backtrace();
+        {
+            let frame = iter.next().unwrap();
+            let mut span = frame.pos as usize..frame.pos as usize;
+            if let Error::SyntaxError(err) = err {
+                span = err.span();
+            }
+
+            let mut snip = Snippet::source(&frame.source.text)
+                .annotation(Level::Error.span(span.clone()))
+                .fold(true);
+            if let Some(origin) = &frame.source.origin {
+                snip = snip.origin(origin);
+            } else if span.start == 0 {
+                // Special simple case for errors on the only command in interactive shell.
+                return self.error_renderer.render(msg).to_string();
+            }
+
+            let (def_note, def_pos) = match &frame.kind {
+                FrameKind::Function { name, def_pos } => {
+                    first_note = format!("in function {name:?}");
+                    (first_note.as_str(), *def_pos)
+                }
+                FrameKind::Pipe { def_pos } => ("in pipeline", *def_pos),
+                FrameKind::CommandSubst { def_pos } => ("in command substitution", *def_pos),
+                FrameKind::Source => ("before sourcing this file", 0),
+            };
+            snip = snip.annotation(
+                Level::Note
+                    .span(def_pos as usize..def_pos as usize)
+                    .label(def_note),
+            );
+
+            msg = msg.snippet(snip);
+        }
+
+        let footers = iter
+            .filter_map(|frame| {
+                let mut s = match &frame.kind {
+                    FrameKind::Function { name, .. } => format!("from function {name:?}"),
+                    FrameKind::Source => "from sourcing".into(),
+                    FrameKind::Pipe { .. } => "from pipeline".into(),
+                    FrameKind::CommandSubst { .. } => "from command substitution".into(),
+                };
+                if let Some(origin) = &frame.source.origin {
+                    let line = 1 + frame.source.text[..frame.pos as usize]
+                        .bytes()
+                        .filter(|&b| b == b'\n')
+                        .count();
+                    write!(s, " {origin}:{line}").unwrap();
+                } else if let FrameKind::Source = frame.kind {
+                    return None;
+                }
+                Some(s)
+            })
+            .collect::<Vec<String>>();
+        msg = msg.footers(footers.iter().map(|msg| Level::Note.title(msg)));
+
+        format!("{}\n", self.error_renderer.render(msg))
+    }
+
     pub async fn emit_error(&mut self, err: Error, set_status: bool) {
-        // TODO: Backtrace.
-        let _: ExecResult<_> = self.io().write_stdout(format!("{err}\n")).await;
-        let st = err.to_status();
+        let msg = self.render_error(&err);
+        let _: ExecResult<_> = self.io().write_stdout(msg).await;
         if set_status {
-            self.set_last_status(st);
+            self.set_last_status(err.to_status());
         }
     }
 
@@ -686,9 +803,30 @@ impl<'a> ExecContext<'a> {
         })
     }
 
-    pub async fn exec_source(&mut self, src: &SourceFile) {
-        for stmt in &src.stmts {
-            if self.exec_stmt(stmt).await.is_break() {
+    pub async fn exec_source(&mut self, origin: Option<String>, text: String) {
+        self.backtrace.push(FrameInfo {
+            kind: FrameKind::Source,
+            source: Rc::new(SourceFile { origin, text }),
+            pos: 0,
+        });
+        let mut this = scopeguard::guard(self, |this| {
+            this.backtrace.pop();
+        });
+        let text = &this.backtrace.last().unwrap().source.text;
+
+        let ast = match parse_source(text) {
+            Ok(src) => src,
+            Err(mut errs) => {
+                // FIXME: More errors?
+                errs.truncate(1);
+                let err = Error::SyntaxError(errs.pop().unwrap());
+                this.emit_error(err, true).await;
+                return;
+            }
+        };
+
+        for stmt in &ast.stmts {
+            if this.exec_stmt(stmt).await.is_break() {
                 break;
             }
         }
@@ -719,6 +857,8 @@ impl<'a> ExecContext<'a> {
                 }
             };
         }
+
+        self.backtrace.last_mut().unwrap().pos = stmt.pos();
 
         match stmt {
             Stmt::Command(_pos, words) => {
@@ -770,7 +910,7 @@ impl<'a> ExecContext<'a> {
             }
             Stmt::Break(_pos) => return ControlFlow::Break(ExecBreak::LoopBreak),
             Stmt::Continue(_pos) => return ControlFlow::Break(ExecBreak::LoopContinue),
-            Stmt::Function(_pos, words, stmt) => {
+            Stmt::Function(pos, words, stmt) => {
                 let words = &*self.expand_words(words).await;
                 let name = tri!(words.first().ok_or(Error::NotOneWord(0)));
                 let name = tri!(validate_function_name(name));
@@ -778,7 +918,14 @@ impl<'a> ExecContext<'a> {
                     <FunctionOpts as clap::Parser>::try_parse_from(words)
                         .map_err(Error::InvalidOptions)
                 );
-                let user_func = command::user_func((**stmt).clone(), opts.description);
+                let user_func = UserFunc(Rc::new(UserFuncImpl {
+                    name: name.to_owned(),
+                    // FIXME: Slow?
+                    stmt: (**stmt).clone(),
+                    description: opts.description,
+                    source: self.backtrace.last().unwrap().source.clone(),
+                    def_pos: *pos,
+                }));
                 self.set_global_func(name.into(), user_func);
             }
             Stmt::Return(_, w) => {
@@ -840,7 +987,7 @@ impl<'a> ExecContext<'a> {
 
                 this.exec_stmt(stmt).await?;
             }
-            Stmt::Pipe(_pos, pipes, last) => {
+            Stmt::Pipe(pos, pipes, last) => {
                 let task_cnt = pipes.len() + 1;
 
                 async fn task(mut ctx: ExecContext<'_>, stmt: &Stmt) -> Status {
@@ -851,7 +998,13 @@ impl<'a> ExecContext<'a> {
                 let pipe_status = {
                     let mut tasks = Vec::with_capacity(task_cnt);
 
-                    let mut subctx = ExecContext::new_inside(self);
+                    let frame = || FrameInfo {
+                        // TODO: Should be command pos.
+                        kind: FrameKind::Pipe { def_pos: *pos },
+                        source: self.backtrace.last().unwrap().source.clone(),
+                        pos: *pos,
+                    };
+                    let mut subctx = ExecContext::new_inside(self, frame());
                     for (lhs, port) in pipes {
                         let (pipe_r, pipe_w) = match os_pipe::pipe().map_err(Error::CreatePipe) {
                             Ok(v) => v,
@@ -874,7 +1027,7 @@ impl<'a> ExecContext<'a> {
                         }
                         tasks.push(task(subctx, lhs));
 
-                        subctx = ExecContext::new_inside(self);
+                        subctx = ExecContext::new_inside(self, frame());
                         subctx.io.stdin = pipe_r;
                     }
                     tasks.push(task(subctx, last));
@@ -1002,6 +1155,13 @@ impl<'a> ExecContext<'a> {
                     }
                 }
                 WordFrag::Command(stmt) | WordFrag::CommandNoSplit(stmt) => {
+                    let pos = stmt.pos();
+                    let frame = FrameInfo {
+                        kind: FrameKind::CommandSubst { def_pos: pos },
+                        source: self.backtrace.last().unwrap().source.clone(),
+                        pos,
+                    };
+
                     let buf = {
                         let buf = Rc::new(RefCell::new(Vec::new()));
                         let buf_weak = Rc::downgrade(&buf);
@@ -1014,9 +1174,13 @@ impl<'a> ExecContext<'a> {
                                 .extend_from_slice(bytes);
                             Ok(Status::SUCCESS)
                         }));
-                        let prev_stdout = std::mem::replace(&mut self.io.stdout, io_collect);
-                        let mut this =
-                            scopeguard::guard(&mut *self, move |this| this.io.stdout = prev_stdout);
+
+                        self.backtrace.push(frame);
+                        let prev_stdout = mem::replace(&mut self.io.stdout, io_collect);
+                        let mut this = scopeguard::guard(&mut *self, move |this| {
+                            this.io.stdout = prev_stdout;
+                            this.backtrace.pop();
+                        });
                         this.exec_stmt(stmt).await;
                         Rc::into_inner(buf).unwrap().into_inner()
                     };

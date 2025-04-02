@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use ghoti_syntax::Stmt;
 
-use crate::{Error, ExecContext, Status, VarScope};
+use crate::{Error, ExecContext, FrameInfo, FrameKind, SourceFile, Status, VarScope};
 
 pub type BoxCommand = Box<dyn Command>;
 
@@ -185,11 +185,20 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct UserFunc(Rc<(Stmt, Option<String>)>);
+pub(crate) struct UserFunc(pub(crate) Rc<UserFuncImpl>);
+
+#[derive(Debug)]
+pub(crate) struct UserFuncImpl {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) source: Rc<SourceFile>,
+    pub(crate) def_pos: u32,
+    pub(crate) stmt: Stmt,
+}
 
 impl UserFunc {
     pub fn stmt(&self) -> &Stmt {
-        &self.0.0
+        &self.0.stmt
     }
 }
 
@@ -204,17 +213,21 @@ impl Command for UserFunc {
         args: &'fut [String],
     ) -> BoxFuture<'fut, ()> {
         Box::pin(async move {
-            let mut subctx = ExecContext::new_inside(ctx);
+            let frame = FrameInfo {
+                kind: FrameKind::Function {
+                    name: self.0.name.clone(),
+                    def_pos: self.0.def_pos,
+                },
+                source: self.0.source.clone(),
+                pos: self.0.stmt.pos(),
+            };
+            let mut subctx = ExecContext::new_inside(ctx, frame);
             subctx.set_var("argv", VarScope::Local, args[1..].to_vec());
-            subctx.exec_stmt(&self.0.0).await;
+            subctx.exec_stmt(&self.0.stmt).await;
         })
     }
 
     fn description(&self) -> Option<&str> {
-        self.0.1.as_deref()
+        self.0.description.as_deref()
     }
-}
-
-pub fn user_func(stmt: Stmt, description: Option<String>) -> impl Command {
-    UserFunc(Rc::new((stmt, description)))
 }

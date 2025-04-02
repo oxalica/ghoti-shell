@@ -1,8 +1,6 @@
 use std::ops::ControlFlow;
 
-use annotate_snippets::{Level, Renderer, Snippet};
 use ghoti_exec::{ExecContext, Status};
-use ghoti_syntax::parse_source;
 use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -62,8 +60,6 @@ impl Completer for ShellHelper<'_, '_> {
 }
 
 pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    let renderer = Renderer::styled();
-
     let mut rl: Editor<ShellHelper, DefaultHistory> = rustyline::Editor::new()?;
     rl.set_helper(Some(ShellHelper { ctx }));
 
@@ -90,23 +86,7 @@ pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Err
         };
         let ctx = &mut *rl.helper_mut().unwrap().ctx;
 
-        let src = match parse_source(&input) {
-            Ok(src) => src,
-            Err(errs) => {
-                for err in errs {
-                    let msg = err.kind.to_string();
-                    let msg = Level::Error
-                        .title(&msg)
-                        .snippet(Snippet::source(&input).annotation(Level::Error.span(err.span())));
-                    println!("{}", renderer.render(msg));
-                }
-
-                ctx.set_last_status(Status(127));
-                continue;
-            }
-        };
-
-        rt.block_on(ctx.exec_source(&src));
+        rt.block_on(ctx.exec_source(None, input));
         // Prevent next prompt from clobbering the output if it contains no newline.
         println!();
     }

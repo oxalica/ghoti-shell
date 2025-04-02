@@ -2,8 +2,6 @@ use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
 
-use ghoti_syntax::parse_source;
-
 use crate::{ExecContext, Executor, Status, Stdio};
 
 #[tokio::test]
@@ -19,8 +17,7 @@ async fn var_scopes() {
     }));
 
     let mut run = async |src: &str| {
-        let src = parse_source(src).unwrap();
-        ctx.exec_source(&src).await;
+        ctx.exec_source(Some("<stdin>".into()), src.into()).await;
         let ret = mem::take(&mut *buf.borrow_mut());
         ret
     };

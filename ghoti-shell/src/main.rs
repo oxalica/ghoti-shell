@@ -1,6 +1,5 @@
 use clap::Parser;
 use ghoti_exec::{ExecContext, Executor, Status, VarScope};
-use ghoti_syntax::parse_source;
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -23,13 +22,11 @@ fn main() -> Result<Status, Box<dyn std::error::Error>> {
         .build()?;
 
     if let Some(cmd) = args.command {
-        let src = parse_source(&cmd).expect("TODO");
-        rt.block_on(ctx.exec_source(&src));
+        rt.block_on(ctx.exec_source(Some("<commandline>".into()), cmd));
     } else if let Some((file, script_args)) = args.args.split_first() {
         let text = std::fs::read_to_string(file)?;
-        let src = parse_source(&text).expect("TODO");
         ctx.set_var("argv", VarScope::Local, script_args.to_vec());
-        rt.block_on(ctx.exec_source(&src));
+        rt.block_on(ctx.exec_source(Some(file.clone()), text));
     } else {
         ghoti_shell::repl::run_repl(&mut ctx)?;
     }

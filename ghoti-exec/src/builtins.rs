@@ -7,7 +7,6 @@ use std::str::FromStr;
 
 use clap::Parser;
 use either::Either;
-use ghoti_syntax::parse_source;
 use owo_colors::AnsiColors;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
 
@@ -294,19 +293,17 @@ pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<()
         return Err(Error::Custom("TODO: source from stdin".into()));
     };
 
-    let path = path.clone();
-    let source = tokio::task::spawn_blocking(move || {
-        let src = std::fs::read_to_string(path).map_err(Error::ReadWrite)?;
-        // TODO: Report more errors.
-        let file = parse_source(&src).map_err(|errs| errs[0].to_string())?;
-        Ok::<_, Error>(file)
+    let text = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || std::fs::read_to_string(path)
     })
     .await
-    .expect("no panic")?;
+    .expect("no panic")
+    .map_err(Error::ReadWrite)?;
 
     let scope = &mut **ctx.enter_local_scope();
     scope.set_var("argv", VarScope::Local, args.to_vec());
-    scope.exec_source(&source).await;
+    scope.exec_source(Some(path.clone()), text).await;
     Ok(())
 }
 

@@ -59,13 +59,12 @@ impl Completer for ShellHelper<'_, '_> {
     }
 }
 
-pub fn run_repl(ctx: &mut ExecContext<'_>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_repl(
+    rt: &tokio::runtime::Runtime,
+    ctx: &mut ExecContext<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut rl: Editor<ShellHelper, DefaultHistory> = rustyline::Editor::new()?;
     rl.set_helper(Some(ShellHelper { ctx }));
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
 
     loop {
         let last_status = rl.helper().unwrap().ctx.last_status();

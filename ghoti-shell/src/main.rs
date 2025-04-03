@@ -28,7 +28,7 @@ fn main() -> Result<Status, Box<dyn std::error::Error>> {
         ctx.set_var("argv", VarScope::Local, script_args.to_vec());
         rt.block_on(ctx.exec_source(Some(file.clone()), text));
     } else {
-        ghoti_shell::repl::run_repl(&mut ctx)?;
+        ghoti_shell::repl::run_repl(&rt, &mut ctx)?;
     }
     Ok(ctx.last_status())
 }

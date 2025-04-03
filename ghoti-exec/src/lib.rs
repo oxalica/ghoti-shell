@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -14,7 +16,6 @@ use ghoti_syntax::{
     self as ast, ParseError, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag, parse_source,
 };
 use io::StdioCollectSink;
-use itertools::EitherOrBoth;
 use tokio::io::AsyncRead;
 use utils::validate_variable_name;
 
@@ -117,8 +118,6 @@ pub enum Error {
     EmptyCommand,
     #[error("command not found: {0}")]
     CommandNotFound(String),
-    #[error("variable not found: {0:?}")]
-    VariableNotFound(String),
     #[error("cannot modify special variable: {0:?}")]
     ModifySpecialVariable(String),
     #[error("syntax error: {}", .0.kind)]
@@ -161,7 +160,6 @@ impl Error {
             Error::NotOneWord(_) => 121,
             Error::EmptyCommand => 123,
             Error::CommandNotFound(_) => 127,
-            Error::VariableNotFound(_) => 1,
             Error::ModifySpecialVariable(_) => 1,
             Error::SyntaxError(_) => 127,
             Error::SpawnProcess(..) => 125,
@@ -187,7 +185,7 @@ pub enum VarScope {
     Universal,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Variable {
     pub value: ValueList,
     pub export: bool,
@@ -357,9 +355,9 @@ impl Executor {
 
 #[derive(Debug)]
 pub struct ExecContext<'a> {
-    local_var_map: BTreeMap<String, usize>,
-    local_vars: Vec<Option<LocalVar>>,
-    cur_scope_idx: usize,
+    local_vars_by_name: BTreeMap<(String, Reverse<u32>), Variable>,
+    local_vars_by_scope: BTreeSet<(u32, String)>,
+    cur_scope_idx: u32,
 
     root: &'a Executor,
     outer: Option<&'a ExecContext<'a>>,
@@ -368,14 +366,6 @@ pub struct ExecContext<'a> {
     io: IoConfig,
 
     backtrace: Vec<FrameInfo>,
-}
-
-#[derive(Debug)]
-struct LocalVar {
-    var: Variable,
-    name: String,
-    scope_idx: usize,
-    shadowed: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -418,9 +408,10 @@ impl Deref for ExecContext<'_> {
 impl<'a> ExecContext<'a> {
     pub fn new(root: &'a Executor) -> Self {
         Self {
-            local_var_map: BTreeMap::new(),
-            local_vars: Vec::new(),
+            local_vars_by_name: BTreeMap::new(),
+            local_vars_by_scope: BTreeSet::new(),
             cur_scope_idx: 0,
+
             root,
             outer: None,
             last_status: Status::SUCCESS,
@@ -572,174 +563,129 @@ impl<'a> ExecContext<'a> {
         self.special_vars.get(name).map(|getter| getter(self))
     }
 
+    pub fn local_vars(&self) -> impl Iterator<Item = (&str, &Variable)> {
+        let mut iter = self.local_vars_by_name.iter().peekable();
+        std::iter::from_fn(move || {
+            let ((name, sid), elem) = iter.next()?;
+            while iter.next_if(|((_, next_sid), _)| sid == next_sid).is_some() {}
+            Some((name.as_str(), elem))
+        })
+    }
+
     pub fn list_vars<B>(
         &self,
         scope: VarScope,
         mut f: impl FnMut(&str, &Variable) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        let local_iter = self
-            .local_var_map
-            .iter()
-            .map(|(name, &idx)| (name.as_str(), &self.local_vars[idx].as_ref().unwrap().var));
         match scope {
             // Does not quite make sense, fish also returns empty for this.
-            VarScope::Function => return ControlFlow::Continue(()),
-            VarScope::Local => {
-                for (name, var) in local_iter {
-                    f(name, var)?;
-                }
-            }
-            VarScope::Global | VarScope::Auto => {
-                let global_vars = self.global_vars();
-                let mut global_iter = global_vars.iter().map(|(name, var)| (name.as_str(), var));
-                let mut merged_iter;
-                let iter = if scope == VarScope::Global {
-                    &mut global_iter as &mut dyn Iterator<Item = _>
-                } else {
-                    merged_iter = itertools::merge_join_by(local_iter, global_iter, |lhs, rhs| {
-                        lhs.0.cmp(rhs.0)
-                    })
-                    .map(|either| either.into_left());
-                    &mut merged_iter
-                };
-
-                for either in
-                    itertools::merge_join_by(iter, self.special_vars(), |lhs, rhs| lhs.0.cmp(rhs.0))
-                {
-                    match either {
-                        EitherOrBoth::Both((name, var), _) | EitherOrBoth::Left((name, var)) => {
-                            f(name, var)?;
-                        }
-                        EitherOrBoth::Right((name, getter)) => {
-                            let val = getter(self);
-                            f(name, &Variable::from(val))?;
-                        }
-                    }
-                }
-            }
+            VarScope::Function => ControlFlow::Continue(()),
+            VarScope::Global => self
+                .global_vars()
+                .iter()
+                .try_for_each(|(name, var)| f(name, var)),
+            VarScope::Local => self.local_vars().try_for_each(|(name, var)| f(name, var)),
+            VarScope::Auto => itertools::merge_join_by(
+                self.local_vars(),
+                self.global_vars()
+                    .iter()
+                    .map(|(name, var)| (name.as_str(), var)),
+                |lhs, rhs| Ord::cmp(lhs.0, rhs.0),
+            )
+            .map(|either| either.into_left())
+            .try_for_each(|(name, var)| f(name, var)),
             VarScope::Universal => todo!(),
         }
-        ControlFlow::Continue(())
+    }
+
+    fn get_local_var(&self, name: String) -> Option<(&Variable, u32)> {
+        let key = (name, Reverse(u32::MAX));
+        let ((varname, sid), val) = self.local_vars_by_name.range(&key..).next()?;
+        (*varname == key.0).then_some((val, sid.0))
+    }
+
+    fn get_local_var_mut(&mut self, name: String) -> Option<(&mut Variable, u32)> {
+        let key = (name, Reverse(u32::MAX));
+        let ((varname, sid), val) = self.local_vars_by_name.range_mut(&key..).next()?;
+        (*varname == key.0).then_some((val, sid.0))
     }
 
     pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = Variable>> {
         if let Some(value) = self.get_special_var(name) {
-            struct Id<T>(T);
-            impl<T> Deref for Id<T> {
-                type Target = T;
-                fn deref(&self) -> &Self::Target {
-                    &self.0
-                }
-            }
-
-            return Some(Either::Left(Id(Variable {
-                value,
-                export: false,
-            })));
+            return Some(Either::Left(Cow::Owned(Variable::from(value))));
         }
+        if let Some((var, _sid)) = self.get_local_var(name.to_owned()) {
+            return Some(Either::Left(Cow::Borrowed(var)));
+        }
+        if let Some(var) = self.get_global_var(name) {
+            return Some(Either::Right(var));
+        }
+        None
+    }
 
-        match self.local_var_map.get(name) {
-            Some(&idx) => Some(Either::Right(Either::Left(
-                &self.local_vars[idx].as_ref().unwrap().var,
-            ))),
-            None => self
-                .get_global_var(name)
-                .map(|v| Either::Right(Either::Right(v))),
+    fn set_local_var_at(&mut self, name: String, sid: u32, var: Variable) {
+        if self
+            .local_vars_by_name
+            .insert((name.clone(), Reverse(sid)), var)
+            .is_none()
+        {
+            self.local_vars_by_scope.insert((sid, name));
         }
     }
 
     pub fn set_var(&mut self, name: impl Into<String>, scope: VarScope, var: impl Into<Variable>) {
         let (name, var) = (name.into(), var.into());
         match scope {
-            VarScope::Function if self.cur_scope_idx > 0 => {
-                if let Some(&idx) = self.local_var_map.get(&name) {
-                    let cur = self.local_vars[idx].as_mut().unwrap();
-                    if cur.scope_idx == 0 {
-                        cur.var = var;
-                    } else {
-                        todo!("set beneath");
-                    }
-                } else {
-                    todo!("set new func var");
-                }
-            }
             VarScope::Local | VarScope::Function => {
-                if let Some(idx) = self.local_var_map.get_mut(&name) {
-                    let cur = self.local_vars[*idx].as_mut().unwrap();
-                    if cur.scope_idx == self.cur_scope_idx {
-                        cur.var = var;
-                    } else {
-                        let shadowed = Some(*idx);
-                        *idx = self.local_vars.len();
-                        self.local_vars.push(Some(LocalVar {
-                            var,
-                            name: name.clone(),
-                            scope_idx: self.cur_scope_idx,
-                            shadowed,
-                        }));
-                    }
+                let sid = if scope == VarScope::Local {
+                    self.cur_scope_idx
                 } else {
-                    self.local_var_map
-                        .insert(name.clone(), self.local_vars.len());
-                    self.local_vars.push(Some(LocalVar {
-                        var,
-                        name,
-                        scope_idx: self.cur_scope_idx,
-                        shadowed: None,
-                    }));
-                }
+                    0
+                };
+                self.set_local_var_at(name, sid, var);
             }
             VarScope::Global => {
                 self.set_global_var(name, var);
             }
             VarScope::Universal => todo!(),
             VarScope::Auto => {
-                let scope = if self.local_var_map.contains_key(&name) {
-                    VarScope::Local
-                } else if self.global_vars().contains_key(&name) {
-                    VarScope::Global
+                if let Some((place, _)) = self.get_local_var_mut(name.clone()) {
+                    *place = var;
+                } else if let Some(place) = self.global_vars.borrow_mut().get_mut(&name) {
+                    *place = var;
                 } else {
-                    VarScope::Function
-                };
-                self.set_var(name, scope, var);
+                    // Function scope by default.
+                    self.set_local_var_at(name, 0, var);
+                }
             }
+        }
+    }
+
+    fn remove_local_var_at(&mut self, name: String, sid: u32) -> bool {
+        let key = (name, Reverse(sid));
+        if self.local_vars_by_name.remove(&key).is_some() {
+            assert!(self.local_vars_by_scope.remove(&(sid, key.0)));
+            true
+        } else {
+            false
         }
     }
 
     pub fn remove_var(&mut self, scope: VarScope, name: &str) -> bool {
         match scope {
-            VarScope::Function if self.cur_scope_idx > 0 => {
-                if let Some(&idx) = self.local_var_map.get(name) {
-                    let mut opt_idx = Some(idx);
-                    while let Some(idx) = opt_idx {
-                        let cur = self.local_vars[idx].as_mut().unwrap();
-                        if cur.scope_idx == 0 {
-                            self.local_vars[idx] = None;
-                            self.local_var_map.remove(name);
-                            return true;
-                        } else {
-                            opt_idx = cur.shadowed;
-                        }
-                    }
+            VarScope::Local if self.cur_scope_idx > 0 => {
+                if let Some((_var, sid)) = self.get_local_var(name.to_owned()) {
+                    assert!(self.remove_local_var_at(name.to_owned(), sid));
+                    true
+                } else {
+                    false
                 }
-                false
             }
-            VarScope::Local | VarScope::Function => {
-                if let Some(idx) = self.local_var_map.get_mut(name) {
-                    let cur = self.local_vars[*idx].take().unwrap();
-                    if let Some(prev_idx) = cur.shadowed {
-                        *idx = prev_idx;
-                    } else {
-                        self.local_var_map.remove(name);
-                    }
-                    return true;
-                }
-                false
-            }
+            VarScope::Local | VarScope::Function => self.remove_local_var_at(name.to_owned(), 0),
             VarScope::Global => self.remove_global_var(name),
             VarScope::Universal => todo!(),
             VarScope::Auto => {
-                self.remove_var(VarScope::Local, name) || self.remove_var(VarScope::Global, name)
+                self.remove_var(VarScope::Local, name) || self.remove_global_var(name)
             }
         }
     }
@@ -793,20 +739,11 @@ impl<'a> ExecContext<'a> {
     pub fn enter_local_scope(&mut self) -> impl DerefMut<Target = &mut Self> {
         self.cur_scope_idx += 1;
         scopeguard::guard(self, |this| {
-            while let Some(var) = this.local_vars.last() {
-                if matches!(var, Some(v) if v.scope_idx < this.cur_scope_idx) {
-                    break;
-                }
-                if let Some(Some(var)) = this.local_vars.pop() {
-                    match var.shadowed {
-                        None => {
-                            this.local_var_map.remove(&var.name);
-                        }
-                        Some(idx) => {
-                            *this.local_var_map.get_mut(&var.name).unwrap() = idx;
-                        }
-                    }
-                }
+            let scope = this
+                .local_vars_by_scope
+                .split_off(&(this.cur_scope_idx, String::new()));
+            for (sid, name) in scope {
+                this.local_vars_by_name.remove(&(name, Reverse(sid)));
             }
             this.cur_scope_idx -= 1;
         })
@@ -909,7 +846,7 @@ impl<'a> ExecContext<'a> {
                 let var = tri!(validate_variable_name(&var[0]));
                 let elems = self.expand_words(elem_ws).await;
                 for elem in elems {
-                    self.set_var(var, VarScope::default(), elem);
+                    self.set_var(var, VarScope::Auto, elem);
                     match self.exec_stmt(body).await {
                         ControlFlow::Break(ExecBreak::LoopContinue) => {}
                         ControlFlow::Break(ExecBreak::LoopBreak) => break,
@@ -1239,12 +1176,7 @@ impl<'a> ExecContext<'a> {
                     let var = self.get_var(var_name);
                     let vals = match &var {
                         Some(var) => &var.value[..],
-                        None => {
-                            drop(var);
-                            self.emit_error(Error::VariableNotFound(var_name.into()), false)
-                                .await;
-                            &[]
-                        }
+                        None => &[],
                     };
                     if matches!(frag, WordFrag::Variable(_)) {
                         frag_expanded.push(vals.to_vec());

@@ -37,6 +37,19 @@ async fn var_scopes() {
 
     assert_eq!(
         run("
+            begin
+                set -l a 0
+                set -f a 1
+                echo $a
+            end
+            echo $a
+        ")
+        .await,
+        "0\n1\n",
+    );
+
+    assert_eq!(
+        run("
             set -g b 0
             set -l a 1
             begin

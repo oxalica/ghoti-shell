@@ -23,7 +23,7 @@ impl Hinter for ShellHelper<'_, '_> {
         }
 
         self.ctx
-            .list_funcs(|name, _cmd| {
+            .list_funcs_without_autoload(|name, _cmd| {
                 if let Some(rest) = name.strip_prefix(line) {
                     return ControlFlow::Break(rest.bright_black().to_string());
                 }
@@ -48,7 +48,7 @@ impl Completer for ShellHelper<'_, '_> {
         }
 
         let mut candidates = Vec::new();
-        self.ctx.list_funcs::<()>(|name, _cmd| {
+        self.ctx.list_funcs_without_autoload::<()>(|name, _cmd| {
             if let Some(rest) = name.strip_prefix(line) {
                 candidates.push(rest.to_string());
             }
@@ -67,11 +67,17 @@ pub fn run_repl(
     rl.set_helper(Some(ShellHelper { ctx }));
 
     loop {
-        let last_status = rl.helper().unwrap().ctx.last_status();
-        let prompt = if last_status.is_success() {
-            "> ".to_owned()
-        } else {
-            format!("[{last_status}]> ")
+        let prompt = {
+            let ctx = &mut *rl.helper_mut().unwrap().ctx;
+            // For completion
+            rt.block_on(ctx.populate_autoload_func_cache());
+
+            let st = ctx.last_status();
+            if st.is_success() {
+                "> ".to_owned()
+            } else {
+                format!("[{st}]> ")
+            }
         };
 
         let input = match rl.readline(&prompt) {

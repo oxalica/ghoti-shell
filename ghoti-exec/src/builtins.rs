@@ -275,17 +275,18 @@ pub async fn functions(ctx: &mut ExecContext<'_>, args: FunctionsOpts) -> ExecRe
             .sum::<usize>();
         Ok(fail_cnt.into())
     } else if args.query {
-        let fail_cnt = args
-            .funcs
-            .iter()
-            .map(|name| ctx.get_func(name).is_none() as usize)
-            .sum::<usize>();
+        let mut fail_cnt = 0usize;
+        for name in &args.funcs {
+            if ctx.get_or_autoload_func(name).await.is_none() {
+                fail_cnt += 1;
+            }
+        }
         Ok(fail_cnt.into())
     } else {
         let mut buf = String::new();
         let mut fail_cnt = 0usize;
         for name in &args.funcs {
-            if let Some(cmd) = ctx.get_func(name) {
+            if let Some(cmd) = ctx.get_or_autoload_func(name).await {
                 let func = cmd.as_any().downcast_ref::<UserFunc>().unwrap();
                 writeln!(buf, "{:#?}", func.stmt()).unwrap();
             } else {

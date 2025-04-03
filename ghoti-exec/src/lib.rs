@@ -16,8 +16,9 @@ use ghoti_syntax::{
     self as ast, ParseError, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag, parse_source,
 };
 use io::StdioCollectSink;
+use itertools::Itertools;
 use tokio::io::AsyncRead;
-use utils::validate_variable_name;
+use utils::{access_can_exec, access_can_read, validate_variable_name};
 
 use crate::io::{Io, IoConfig};
 use crate::utils::validate_function_name;
@@ -30,7 +31,15 @@ mod utils;
 #[cfg(test)]
 mod tests;
 
-const HOME_VAR: &str = "HOME";
+// Well-known variables.
+const VAR_STATUS: &str = "status";
+const VAR_STATUS_GENERATION: &str = "status_generation";
+const VAR_PIPE_STATUS: &str = "pipestatus";
+const VAR_PATH: &str = "PATH";
+const VAR_HOME: &str = "HOME";
+const VAR_AUTOLOAD_PATH: &str = "fish_function_path";
+
+const AUTOLOAD_NAME_SUFFIX: &str = ".fish";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -185,10 +194,18 @@ pub enum VarScope {
     Universal,
 }
 
+// FIXME: Cloning this is no good.
 #[derive(Debug, Clone)]
 pub struct Variable {
     pub value: ValueList,
     pub export: bool,
+    cache: Option<RefCell<Box<VarCache>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VarCache {
+    /// For `VAR_AUTOLOAD_PATH`, this is a map of function-name => autoload-path.
+    name_to_path: Option<BTreeMap<String, PathBuf>>,
 }
 
 impl Variable {
@@ -200,12 +217,32 @@ impl Variable {
         Self {
             value: vals.into_iter().collect(),
             export: false,
+            cache: None,
         }
     }
 
     pub fn exported(mut self) -> Self {
         self.export = true;
         self
+    }
+
+    fn with_cache(mut self) -> Self {
+        self.cache = Some(Default::default());
+        self
+    }
+
+    fn name_to_path_cache(&self) -> Ref<'_, Option<BTreeMap<String, PathBuf>>> {
+        Ref::map(self.cache.as_ref().expect("has cache").borrow(), |cache| {
+            &cache.name_to_path
+        })
+    }
+
+    fn set_name_to_path_cache(&self, cache: BTreeMap<String, PathBuf>) {
+        self.cache
+            .as_ref()
+            .expect("has cache")
+            .borrow_mut()
+            .name_to_path = Some(cache);
     }
 }
 
@@ -225,11 +262,12 @@ type DynSpecialVarGetter = dyn Fn(&ExecContext<'_>) -> ValueList;
 
 pub struct Executor {
     builtin_funcs: BTreeMap<String, Box<dyn Command>>,
+    /// Special read-only variables implemented as getters.
+    special_vars: BTreeMap<String, Box<DynSpecialVarGetter>>,
+
     global_funcs: RefCell<BTreeMap<String, Box<dyn Command>>>,
     global_vars: RefCell<BTreeMap<String, Variable>>,
 
-    /// Special read-only variables implemented as getters.
-    special_vars: BTreeMap<String, Box<DynSpecialVarGetter>>,
     error_renderer: annotate_snippets::Renderer,
 }
 
@@ -252,15 +290,17 @@ impl Default for Executor {
         this.builtin_funcs
             .extend(builtins::all_builtins().map(|(name, cmd)| (name.to_owned(), cmd)));
 
-        this.set_special_var("status", |ctx| vec![ctx.last_status().to_string()]);
+        this.set_special_var(VAR_STATUS, |ctx| vec![ctx.last_status().to_string()]);
         // TODO?
-        this.set_special_var("status_generation", |_ctx| vec!["0".into()]);
-        this.set_special_var("pipestatus", |ctx| {
+        this.set_special_var(VAR_STATUS_GENERATION, |_ctx| vec!["0".into()]);
+        this.set_special_var(VAR_PIPE_STATUS, |ctx| {
             ctx.last_pipe_status()
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
         });
+
+        this.set_global_var(VAR_AUTOLOAD_PATH, Variable::new_list([]).with_cache());
 
         this
     }
@@ -270,9 +310,11 @@ impl Executor {
     pub fn new() -> Self {
         Self {
             builtin_funcs: BTreeMap::new(),
+            special_vars: BTreeMap::new(),
+
             global_funcs: RefCell::new(BTreeMap::new()),
             global_vars: RefCell::new(BTreeMap::new()),
-            special_vars: BTreeMap::new(),
+
             error_renderer: annotate_snippets::Renderer::plain(),
         }
     }
@@ -320,10 +362,6 @@ impl Executor {
         self.special_vars.remove(name).is_some()
     }
 
-    pub(crate) fn global_funcs(&self) -> Ref<'_, BTreeMap<String, BoxCommand>> {
-        self.global_funcs.borrow()
-    }
-
     pub fn get_global_func(&self, name: &str) -> Option<BoxCommand> {
         self.global_funcs.borrow().get(name).cloned()
     }
@@ -344,8 +382,8 @@ impl Executor {
         Ref::filter_map(self.global_vars.borrow(), |m| m.get(name)).ok()
     }
 
-    pub fn set_global_var(&self, name: String, var: Variable) {
-        self.global_vars.borrow_mut().insert(name, var);
+    pub fn set_global_var(&self, name: impl Into<String>, var: Variable) {
+        self.global_vars.borrow_mut().insert(name.into(), var);
     }
 
     pub fn remove_global_var(&self, name: &str) -> bool {
@@ -532,27 +570,57 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    pub fn list_funcs<B>(
-        &self,
-        mut f: impl FnMut(&str, &BoxCommand) -> ControlFlow<B>,
+    pub async fn list_funcs<B>(
+        &mut self,
+        f: impl FnMut(&str, Option<&BoxCommand>) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for (name, cmd) in itertools::merge_join_by(
-            self.global_funcs()
-                .iter()
-                .map(|(name, cmd)| (&name[..], cmd)),
-            self.builtins(),
-            |lhs, rhs| lhs.0.cmp(rhs.0),
-        )
-        .map(|kv| kv.into_left())
+        self.populate_autoload_func_cache().await;
+        self.list_funcs_without_autoload(f)
+    }
+
+    pub fn list_funcs_without_autoload<B>(
+        &self,
+        mut f: impl FnMut(&str, Option<&BoxCommand>) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        let global_funcs = self.global_funcs.borrow();
+        let global_funcs = global_funcs
+            .iter()
+            .map(|(name, cmd)| (&name[..], Some(cmd)));
+
+        let builtin_funcs = self.builtins().map(|(name, cmd)| (name, Some(cmd)));
+
+        let autoload_var = self.get_var(VAR_AUTOLOAD_PATH);
+        let autoload_cache = autoload_var.as_ref().map(|var| var.name_to_path_cache());
+        let autoload_funcs = autoload_cache
+            .as_ref()
+            .and_then(|cache| cache.as_ref())
+            .into_iter()
+            .flat_map(|map| map.keys())
+            .map(|name| (name.as_str(), None));
+
+        for (name, cmd) in global_funcs
+            .merge_join_by(autoload_funcs, |lhs, rhs| lhs.0.cmp(rhs.0))
+            .map(|either| either.into_left())
+            .merge_join_by(builtin_funcs, |lhs, rhs| lhs.0.cmp(rhs.0))
+            .map(|either| either.into_left())
         {
             f(name, cmd)?;
         }
         ControlFlow::Continue(())
     }
 
-    pub fn get_func(&self, name: &str) -> Option<BoxCommand> {
-        self.get_global_func(name)
-            .or_else(|| self.get_builtin(name))
+    pub async fn get_or_autoload_func(&mut self, name: &str) -> Option<BoxCommand> {
+        if let Some(func) = self.get_global_func(name) {
+            return Some(func);
+        }
+
+        if validate_function_name(name).is_ok() && self.try_autoload_func(name).await.is_some() {
+            if let Some(cmd) = self.get_global_func(name) {
+                return Some(cmd);
+            }
+        }
+
+        self.get_builtin(name)
     }
 
     pub fn has_special_var(&self, name: &str) -> bool {
@@ -634,7 +702,10 @@ impl<'a> ExecContext<'a> {
     }
 
     pub fn set_var(&mut self, name: impl Into<String>, scope: VarScope, var: impl Into<Variable>) {
-        let (name, var) = (name.into(), var.into());
+        let (name, mut var) = (name.into(), var.into());
+        if name == VAR_AUTOLOAD_PATH {
+            var = var.with_cache();
+        }
         match scope {
             VarScope::Local | VarScope::Function => {
                 let sid = if scope == VarScope::Local {
@@ -690,9 +761,76 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    pub fn locate_external_command(&self, name: &str) -> LocateExternalCommand {
-        use rustix::fs::{Access, access};
+    /// Populate autoload functions cache if it's uninitialized or dirty.
+    pub async fn populate_autoload_func_cache(&mut self) {
+        let Some(var) = self.get_var(VAR_AUTOLOAD_PATH) else {
+            return;
+        };
 
+        if dbg!(var.name_to_path_cache().is_some()) {
+            return;
+        }
+
+        let paths = var.value.clone();
+        let map = tokio::task::spawn_blocking(move || {
+            let mut map = BTreeMap::new();
+            for (name, path) in paths
+                .iter()
+                .flat_map(std::fs::read_dir)
+                .flatten()
+                .filter_map(|ent| {
+                    let ent = ent.ok()?;
+                    ent.file_type().ok().filter(|ft| ft.is_file())?;
+                    let mut name = ent.file_name().into_string().ok()?;
+                    name.truncate(name.strip_suffix(AUTOLOAD_NAME_SUFFIX)?.len());
+                    let path = ent.path();
+                    access_can_read(&path).then_some((name, path))
+                })
+            {
+                map.entry(name).or_insert(path);
+            }
+            map
+        })
+        .await
+        .expect("no panic");
+
+        var.set_name_to_path_cache(dbg!(map));
+    }
+
+    /// Try to find and source the autoload function `name`.
+    ///
+    /// Return `Some(())` if a file is found and sourced, `None` otherwise.
+    /// It does not check if the sourced file actually contains any relavent definition.
+    async fn try_autoload_func(&mut self, name: &str) -> Option<()> {
+        debug_assert!(!name.contains("/"));
+
+        self.populate_autoload_func_cache().await;
+        let path = self
+            .get_var(VAR_AUTOLOAD_PATH)?
+            .name_to_path_cache()
+            .as_ref()
+            .expect("populated")
+            .get(name)?
+            .to_owned();
+
+        let (ret, path) =
+            tokio::task::spawn_blocking(move || (std::fs::read_to_string(&path), path))
+                .await
+                .expect("no panic");
+        match ret {
+            Ok(text) => {
+                self.exec_source(Some(path.to_string_lossy().into_owned()), text)
+                    .await;
+                Some(())
+            }
+            Err(err) => {
+                self.emit_error(Error::ReadWrite(err), false).await;
+                None
+            }
+        }
+    }
+
+    pub fn locate_external_command(&self, name: &str) -> LocateExternalCommand {
         // Absolute or relative path.
         if name.contains("/") {
             let p = Path::new(name);
@@ -700,7 +838,7 @@ impl<'a> ExecContext<'a> {
                 Ok(m) => {
                     if m.is_dir() {
                         LocateExternalCommand::Dir(p.into())
-                    } else if m.is_file() && access(p, Access::EXEC_OK).is_ok() {
+                    } else if m.is_file() && access_can_exec(p) {
                         LocateExternalCommand::ExecFile(p.into())
                     } else {
                         LocateExternalCommand::NotExecFile(p.into())
@@ -716,12 +854,12 @@ impl<'a> ExecContext<'a> {
         }
 
         // Finally, search for external commands in PATH.
-        if let Some(path) = self.get_var("PATH") {
+        if let Some(path) = self.get_var(VAR_PATH) {
             let mut found_file = None;
             for dir in path.value.iter().flat_map(|s| s.split(':')) {
                 let p = Path::new(dir).join(name);
                 if let Ok(m) = p.metadata() {
-                    if m.is_file() && access(&p, Access::EXEC_OK).is_ok() {
+                    if m.is_file() && access_can_exec(&p) {
                         return LocateExternalCommand::ExecFile(p);
                     }
                     found_file.get_or_insert(p);
@@ -997,7 +1135,7 @@ impl<'a> ExecContext<'a> {
     pub async fn exec_command(&mut self, words: &[String]) -> ExecResult<()> {
         let cmd = words.first().ok_or(Error::EmptyCommand)?;
 
-        if let Some(cmd) = self.get_func(cmd) {
+        if let Some(cmd) = self.get_or_autoload_func(cmd).await {
             cmd.exec(self, words).await;
             return Ok(());
         }
@@ -1246,7 +1384,7 @@ impl<'a> ExecContext<'a> {
     }
 
     fn get_home(&self, slash: bool) -> Option<String> {
-        let var = self.get_var(HOME_VAR)?;
+        let var = self.get_var(VAR_HOME)?;
         let mut s = var.value.join(" ");
         let pos = s.trim_end_matches('/').len();
         s.truncate(pos);

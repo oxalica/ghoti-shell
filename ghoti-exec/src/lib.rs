@@ -381,7 +381,7 @@ impl Executor {
         self.global_vars.borrow()
     }
 
-    pub fn get_global_var(&self, name: &str) -> Option<impl Deref<Target = Variable>> {
+    pub fn get_global_var(&self, name: &str) -> Option<impl Deref<Target = Variable> + use<'_>> {
         Ref::filter_map(self.global_vars.borrow(), |m| m.get(name)).ok()
     }
 
@@ -681,7 +681,7 @@ impl<'a> ExecContext<'a> {
         (*varname == key.0).then_some((val, sid.0))
     }
 
-    pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = Variable>> {
+    pub fn get_var(&self, name: &str) -> Option<impl Deref<Target = Variable> + use<'_>> {
         if let Some(value) = self.get_special_var(name) {
             return Some(Either::Left(Cow::Owned(Variable::from(value))));
         }
@@ -1294,8 +1294,8 @@ impl<'a> ExecContext<'a> {
                     dfs(ret, stack, rest_frags, expanded);
                     stack.truncate(prev_len);
                 }
-                WordFrag::Variable(_)
-                | WordFrag::VariableNoSplit(_)
+                WordFrag::Variable { .. }
+                | WordFrag::VariableNoSplit { .. }
                 | WordFrag::Command(_)
                 | WordFrag::CommandNoSplit(_)
                 | WordFrag::Brace(_)
@@ -1326,13 +1326,20 @@ impl<'a> ExecContext<'a> {
         for frag in frags {
             match frag {
                 WordFrag::Literal(_) => {}
-                WordFrag::Variable(var_name) | WordFrag::VariableNoSplit(var_name) => {
-                    let var = self.get_var(var_name);
-                    let vals = match &var {
-                        Some(var) => &var.value[..],
-                        None => &[],
-                    };
-                    if matches!(frag, WordFrag::Variable(_)) {
+                WordFrag::Variable { name, deref } | WordFrag::VariableNoSplit { name, deref } => {
+                    let var1 = self.get_var(name);
+                    let var2;
+                    let mut vals = var1.as_ref().map_or(&[][..], |var| &var.value[..]);
+                    match (*deref, vals.len()) {
+                        (0, _) => {}
+                        (1, 0) => vals = &[],
+                        (1, 1) => {
+                            var2 = self.get_var(&vals[0]);
+                            vals = var2.as_ref().map_or(&[], |var| &var.value[..]);
+                        }
+                        _ => todo!(),
+                    }
+                    if matches!(frag, WordFrag::Variable { .. }) {
                         frag_expanded.push(vals.to_vec());
                     } else {
                         frag_expanded.push(vec![vals.join(" ")]);

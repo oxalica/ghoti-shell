@@ -181,8 +181,8 @@ impl Word {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WordFrag {
     Literal(String),
-    Variable(String),
-    VariableNoSplit(String),
+    Variable { name: String, deref: u8 },
+    VariableNoSplit { name: String, deref: u8 },
     Command(Stmt),
     CommandNoSplit(Stmt),
 

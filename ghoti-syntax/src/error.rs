@@ -26,6 +26,8 @@ pub enum ParseErrorKind {
     UnexpectedEof(String),
     #[error("extra tokens")]
     ExtraToken,
+    #[error("too many dereferences")]
+    TooManyDeref,
 
     #[error("invalid redirection port")]
     InvalidRedirectPort,

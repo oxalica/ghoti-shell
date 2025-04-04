@@ -105,7 +105,7 @@ enum Token<'i> {
     // String context.
     #[token("\"")]
     DQuote,
-    #[regex(r#"\$\w+"#)]
+    #[regex(r#"\$+\w+"#)]
     Variable(&'i str),
     #[token("$(")]
     DollarLParen,
@@ -125,7 +125,7 @@ fn unescape_unicode(s: &str, radix: u32) -> Option<char> {
 enum TokenDString<'i> {
     #[token("\"")]
     DQuote,
-    #[regex(r#"\$\w+"#)]
+    #[regex(r#"\$+\w+"#)]
     Variable(&'i str),
     #[token("$(")]
     DollarLParen,

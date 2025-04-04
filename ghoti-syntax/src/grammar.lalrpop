@@ -189,7 +189,11 @@ WordJoined: Word = {
 WordFrag: WordFrag = {
     "~/" => WordFrag::Home { slash: true },
     <WORD> => WordFrag::Literal(<>.into()),
-    <"$VAR"> => WordFrag::Variable(<>[1..].into()),
+    <lpos:@L> <s:"$VAR"> <rpos:@R> =>? {
+        let name = s.trim_start_matches('$');
+        let deref = u8::try_from(s.len() - name.len() - 1).map_err(|_| E::new(lpos, rpos, K::TooManyDeref))?;
+        Ok(WordFrag::Variable { name: name.into(), deref })
+    },
     <ESCAPE> => WordFrag::Literal(<>.into()),
     "*" => WordFrag::Wildcard,
     "**" => WordFrag::WildcardRecursive,
@@ -203,7 +207,11 @@ String: Vec<WordFrag> = {
     "'" <SQuoteFrag*> "'" => <>,
 };
 DQuoteFrag: WordFrag = {
-    <"$VAR"> => WordFrag::VariableNoSplit(<>[1..].into()),
+    <lpos:@L> <s:"$VAR"> <rpos:@R> =>? {
+        let name = s.trim_start_matches('$');
+        let deref = u8::try_from(s.len() - name.len() - 1).map_err(|_| E::new(lpos, rpos, K::TooManyDeref))?;
+        Ok(WordFrag::VariableNoSplit { name: name.into(), deref })
+    },
     "$(" <StmtBlock> ")" => WordFrag::CommandNoSplit(<>),
     <STRING_FRAGMENT> => WordFrag::Literal(<>.into()),
 };

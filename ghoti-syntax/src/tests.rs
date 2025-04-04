@@ -5,7 +5,7 @@ fn smoke() {
     let src = r#"
         #!shebang
         echo hello$(world) 2>>o <i | cat; or true
-        not $true; and "th$is\$"; or that
+        not $true; and "th$$$$is\$"; or that
     "#;
     let ast = parse_source(src).unwrap();
     println!("{ast:?}");

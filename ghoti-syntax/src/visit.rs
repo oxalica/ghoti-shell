@@ -144,8 +144,8 @@ define_visitor! {
     fn visit_word_frag_mut(v, frag: &'i mut WordFrag) {
         match frag {
             WordFrag::Literal(_) |
-            WordFrag::Variable(_) |
-            WordFrag::VariableNoSplit(_) |
+            WordFrag::Variable { .. } |
+            WordFrag::VariableNoSplit { .. } |
             WordFrag::Home { .. } |
             WordFrag::Wildcard |
             WordFrag::WildcardRecursive => {}

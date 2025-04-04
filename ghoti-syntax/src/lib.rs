@@ -1,5 +1,4 @@
 use std::fmt;
-use std::num::ParseIntError;
 use std::str::FromStr;
 
 mod error;
@@ -76,17 +75,17 @@ pub struct SwitchCase {
 pub struct Redirect {
     pub port: RedirectPort,
     pub mode: RedirectMode,
-    pub dest: RedirectDest,
+    pub dest: Word,
 }
 
 impl Redirect {
-    pub fn new(port: RedirectPort, mode: RedirectMode, dest: RedirectDest) -> Self {
+    pub fn new(port: RedirectPort, mode: RedirectMode, dest: Word) -> Self {
         Self { port, mode, dest }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct RedirectPort(u32);
+pub struct RedirectPort(u16);
 
 impl RedirectPort {
     pub const STDIN: Self = Self(0);
@@ -100,6 +99,7 @@ impl fmt::Debug for RedirectPort {
         f.write_str(match *self {
             Self::STDIN => "STDIN",
             Self::STDOUT => "STDOUT",
+            Self::STDERR => "STDERR",
             Self::STDOUT_STDERR => "STDOUT_STDERR",
             _ => return f.debug_tuple("RedirectPort").field(&self.0).finish(),
         })
@@ -107,11 +107,17 @@ impl fmt::Debug for RedirectPort {
 }
 
 impl FromStr for RedirectPort {
-    type Err = ParseIntError;
+    type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v = s.parse::<u16>()?;
-        Ok(Self(v.into()))
+        let v = s.parse::<u16>().ok().filter(|&p| p != !0).ok_or(())?;
+        Ok(Self(v))
+    }
+}
+
+impl RedirectPort {
+    pub fn port(self) -> Option<u16> {
+        (self.0 != !0).then_some(self.0)
     }
 }
 
@@ -119,27 +125,27 @@ impl FromStr for RedirectPort {
 pub enum RedirectMode {
     Read,
     ReadOrNull,
+    ReadFd,
+
     Write,
     WriteNoClobber,
     Append,
+    WriteFd,
 }
 
 impl RedirectMode {
     #[must_use]
     pub fn default_port(self) -> RedirectPort {
         match self {
-            RedirectMode::Read | RedirectMode::ReadOrNull => RedirectPort::STDIN,
-            RedirectMode::Write | RedirectMode::WriteNoClobber | RedirectMode::Append => {
-                RedirectPort::STDOUT
+            RedirectMode::Read | RedirectMode::ReadOrNull | RedirectMode::ReadFd => {
+                RedirectPort::STDIN
             }
+            RedirectMode::Write
+            | RedirectMode::WriteNoClobber
+            | RedirectMode::Append
+            | RedirectMode::WriteFd => RedirectPort::STDOUT,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RedirectDest {
-    File(Word),
-    Fd(Word),
 }
 
 pub type Words = Vec<Word>;

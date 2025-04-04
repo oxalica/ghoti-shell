@@ -1,7 +1,5 @@
 #![expect(clippy::ptr_arg, reason = "Follow original type to use `&mut Vec<_>`")]
-use crate::{
-    Pos, Redirect, RedirectDest, RedirectPort, SourceFile, Stmt, SwitchCase, Word, WordFrag,
-};
+use crate::{Pos, Redirect, RedirectPort, SourceFile, Stmt, SwitchCase, Word, WordFrag};
 
 macro_rules! define_visitor {
     (
@@ -132,16 +130,9 @@ define_visitor! {
 
     fn visit_redirect_mut(v, redirect: &'i mut Redirect) {
         v.visit_redirect_port_mut(&mut redirect.port);
-        v.visit_redirect_dest_mut(&mut redirect.dest);
     }
 
     fn visit_redirect_port_mut(_v, _port: &'i mut RedirectPort) {}
-
-    fn visit_redirect_dest_mut(v, dest: &'i mut RedirectDest) {
-        let (RedirectDest::File(w)| RedirectDest::Fd(w)) = dest;
-        v.visit_word_mut(w);
-    }
-
 
     fn visit_word_mut(v, w: &'i mut Word) {
         match w {

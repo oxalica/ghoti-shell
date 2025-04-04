@@ -4,7 +4,7 @@ use crate::{ParseErrorKind, Stmt, Word, WordFrag, parse_source};
 fn smoke() {
     let src = r#"
         #!shebang
-        echo hello$(world) &2>>o <i | cat; or true
+        echo hello$(world) 2>>o <i | cat; or true
         not $true; and "th$is\$"; or that
     "#;
     let ast = parse_source(src).unwrap();
@@ -98,7 +98,6 @@ fn invalid_break_continue() {
 fn home() {
     let src = "~ ~/a";
     let ast = parse_source(src).unwrap();
-    dbg!(&ast);
     assert!(matches!(
         &ast.stmts[0],
         Stmt::Command(_, ws)
@@ -116,11 +115,27 @@ fn home() {
 
 #[test]
 fn pipe() {
-    let src = "1 | 2 &2>| 3 &| 4";
+    let src = "1 | 2 2>| 3 &| 4";
     let ast = parse_source(src).unwrap();
     assert!(matches!(
         &ast.stmts[0],
         Stmt::Pipe(_, pipes, _)
         if pipes.len() == 3
+    ));
+}
+
+#[test]
+fn unknow_escape() {
+    let src = r#"'\d'"#;
+    let ast = parse_source(src).unwrap();
+    assert!(matches!(
+        &ast.stmts[0],
+        Stmt::Command(_, ws)
+        if matches!(
+            &ws[..],
+            // FIXME: Should simplify this.
+            [Word::Complex(frags)]
+            if frags[0] == WordFrag::Literal(r"\d".into())
+        )
     ));
 }

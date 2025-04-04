@@ -52,38 +52,14 @@ enum Token<'i> {
     LParen,
     #[token(")")]
     RParen,
-    #[token("[")]
-    LBracket,
-    #[token("]")]
-    RBracket,
     #[token("{")]
     LBrace,
     #[token("}")]
     RBrace,
-    #[token(">")]
-    Gt,
-    #[token(">?")]
-    GtQus,
-    #[token(">&")]
-    GtAmp,
-    #[token(">>")]
-    GtGt,
-    #[token("<")]
-    Lt,
-    #[token("<?")]
-    LtQus,
-    #[token("<&")]
-    LtAmp,
-    #[token("&")]
-    Amp,
-    #[token("?")]
-    Qus,
     #[token("|")]
     Pipe,
     #[token("&|")]
     AmpPipe,
-    #[token(">|")]
-    GtPipe,
     #[token(";")]
     Semi,
     #[token("*")]
@@ -95,22 +71,41 @@ enum Token<'i> {
     #[token("~/")]
     TildeSlash,
 
+    #[token("&>")]
+    AmpGt,
+    #[regex(r"\d*<")]
+    Lt(&'i str),
+    #[regex(r"\d*<\?")]
+    LtQus(&'i str),
+    #[regex(r"\d*<&")]
+    LtAmp(&'i str),
+    #[regex(r"\d*>")]
+    Gt(&'i str),
+    #[regex(r"\d*>\?")]
+    GtQus(&'i str),
+    #[regex(r"\d*>&")]
+    GtAmp(&'i str),
+    #[regex(r"\d*>>")]
+    GtGt(&'i str),
+    #[regex(r"\d*>\|")]
+    GtPipe(&'i str),
+
     // Words.
-    #[regex(r"[\w%+,\-./=@^]+")]
+    #[regex(r"[\w%+,\-./=@^:!?\[\]]+")]
     #[regex(r#"\\\r?\n"#, |_| "")]
-    #[token(r#"\\"#, |_| "\\")]
-    #[token(r#"\""#, |_| "\"")]
-    #[token(r#"\'"#, |_| "'")]
-    #[token(r#"\a"#, |_| "\x07")]
-    #[token(r#"\e"#, |_| "\x1b")]
-    #[token(r#"\n"#, |_| "\n")]
-    #[token(r#"\r"#, |_| "\r")]
+    #[regex(r#"\\."#, unescape_word_single)]
     Word(&'i str),
+
+    #[regex(r#"\\x[0-9a-fA-F]{2}"#, |lex| unescape_unicode(&lex.slice()[2..], 16))]
+    #[regex(r#"\\[0-7]{3}"#, |lex| unescape_unicode(&lex.slice()[2..], 8))]
+    #[regex(r#"\\u[0-9a-fA-F]{4}"#, |lex| unescape_unicode(&lex.slice()[2..], 16))]
+    #[regex(r#"\\U[0-9a-fA-F]{8}"#, |lex| unescape_unicode(&lex.slice()[2..], 16))]
+    Escape(char),
 
     // String context.
     #[token("\"")]
     DQuote,
-    #[regex(r#"\$\w+"#, |lexer| &lexer.slice()[1..])]
+    #[regex(r#"\$\w+"#)]
     Variable(&'i str),
     #[token("$(")]
     DollarLParen,
@@ -122,29 +117,60 @@ enum Token<'i> {
     Join,
 }
 
+fn unescape_unicode(s: &str, radix: u32) -> Option<char> {
+    char::from_u32(u32::from_str_radix(s, radix).ok()?)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Logos)]
 enum TokenDString<'i> {
     #[token("\"")]
     DQuote,
-    #[regex(r#"\$\w+"#, |lexer| &lexer.slice()[1..])]
+    #[regex(r#"\$\w+"#)]
     Variable(&'i str),
     #[token("$(")]
     DollarLParen,
     #[regex(r#"[^"\\$]+"#)]
-    #[token(r#"\\"#, |_| "\\")]
-    #[token(r#"\""#, |_| "\"")]
-    #[token(r#"\$"#, |_| "$")]
+    #[regex(r"\\.", unescape_dquote)]
     Verbatim(&'i str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Logos)]
 enum TokenSString<'i> {
-    #[regex(r#"[^'\\]+"#)]
-    #[token(r#"\\"#, |_| "\\")]
-    #[token(r#"\'"#, |_| "'")]
+    #[regex(r"[^'\\]+")]
+    #[regex(r"\\.", unescape_squote)]
     Verbatim(&'i str),
     #[token("'")]
     SQuote,
+}
+
+fn unescape_word_single<'i>(lex: &mut Lexer<'i, Token<'i>>) -> &'i str {
+    match &lex.slice()[1..] {
+        "\\" => "\\",
+        "\"" => "\"",
+        "'" => "'",
+        "a" => "\x07",
+        "e" => "\x1b",
+        "n" => "\n",
+        "r" => "\r",
+        s => s,
+    }
+}
+
+fn unescape_dquote<'i>(lex: &mut Lexer<'i, TokenDString<'i>>) -> &'i str {
+    match lex.slice() {
+        "\\\\" => "\\",
+        "\\\"" => "\"",
+        "\\$" => "$",
+        s => s,
+    }
+}
+
+fn unescape_squote<'i>(lex: &mut Lexer<'i, TokenSString<'i>>) -> &'i str {
+    match lex.slice() {
+        r"\'" => r"'",
+        r"\\" => r"\",
+        s => s,
+    }
 }
 
 impl<'i> From<TokenDString<'i>> for Token<'i> {
@@ -172,14 +198,7 @@ fn lex(src: &str) -> Result<Vec<(usize, Token<'_>, usize)>> {
         matches!(
             tok,
             Token::Word(_)
-                | Token::Gt
-                | Token::GtQus
-                | Token::GtAmp
-                | Token::GtGt
-                | Token::Lt
-                | Token::LtAmp
-                | Token::LtQus
-                | Token::Amp
+                | Token::Escape(_)
                 | Token::Star
                 | Token::TildeSlash
                 | Token::Tilde
@@ -194,14 +213,7 @@ fn lex(src: &str) -> Result<Vec<(usize, Token<'_>, usize)>> {
         matches!(
             tok,
             Token::Word(_)
-                | Token::Gt
-                | Token::GtQus
-                | Token::GtAmp
-                | Token::GtGt
-                | Token::Lt
-                | Token::LtAmp
-                | Token::LtQus
-                | Token::Amp
+                | Token::Escape(_)
                 | Token::Star
                 | Token::TildeSlash
                 | Token::Tilde

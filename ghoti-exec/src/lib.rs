@@ -13,7 +13,7 @@ use builtins::FunctionOpts;
 use command::{BoxCommand, Command, UserFunc, UserFuncImpl};
 use either::Either;
 use ghoti_syntax::{
-    self as ast, ParseError, RedirectDest, RedirectMode, RedirectPort, Stmt, WordFrag, parse_source,
+    self as ast, ParseError, RedirectMode, RedirectPort, Stmt, WordFrag, parse_source,
 };
 use io::StdioCollectSink;
 use itertools::Itertools;
@@ -135,6 +135,8 @@ pub enum Error {
     // System errors.
     #[error("read/write error: {0}")]
     ReadWrite(stdio::Error),
+    #[error("failed open redirection port {0:?}")]
+    InvalidRedirectionPort(String),
     #[error("failed open redirection file {0:?}: {1}")]
     OpenRedirectionFile(PathBuf, stdio::Error),
     #[error("failed to spawn process {0:?}: {1}")]
@@ -173,6 +175,7 @@ impl Error {
             Error::SyntaxError(_) => 127,
             Error::SpawnProcess(..) => 125,
             Error::ReadWrite(_) => 1,
+            Error::InvalidRedirectionPort(_) => 2,
             Error::OpenRedirectionFile(..) => 1,
             Error::PipeClosed => 1,
             Error::CreatePipe(_) => 1,
@@ -1036,34 +1039,46 @@ impl<'a> ExecContext<'a> {
                 let mut this = scopeguard::guard(&mut *self, |this| this.io = prev_io);
 
                 for redir in redirects {
-                    let (RedirectDest::File(file_word) | RedirectDest::Fd(file_word)) = &redir.dest;
-                    let expanded = this.expand_words(slice::from_ref(file_word)).await;
-                    let [file_path] = &*expanded else {
-                        bail!(this, Error::NotOneWord(expanded.len()));
+                    let dest = this.expand_words(slice::from_ref(&redir.dest)).await;
+                    let [dest] = &*dest else {
+                        bail!(this, Error::NotOneWord(dest.len()));
                     };
-                    match redir.dest {
-                        RedirectDest::File(_) => {}
-                        RedirectDest::Fd(_) => todo!(),
-                    }
-                    let mut opt = OpenOptions::new();
-                    match redir.mode {
-                        RedirectMode::Read | RedirectMode::ReadOrNull => opt.read(true),
-                        RedirectMode::Write => opt.write(true).create(true),
-                        RedirectMode::WriteNoClobber => opt.write(true).create_new(true),
-                        RedirectMode::Append => opt.append(true).create(true),
+
+                    let io = 'io: {
+                        let mut opt = OpenOptions::new();
+                        match redir.mode {
+                            RedirectMode::Read | RedirectMode::ReadOrNull => opt.read(true),
+                            RedirectMode::Write => opt.write(true).create(true),
+                            RedirectMode::WriteNoClobber => opt.write(true).create_new(true),
+                            RedirectMode::Append => opt.append(true).create(true),
+                            RedirectMode::ReadFd | RedirectMode::WriteFd => {
+                                let port = tri!(
+                                    this,
+                                    dest.parse::<RedirectPort>()
+                                        .map_err(|_| Error::InvalidRedirectionPort(dest.into()))
+                                );
+                                break 'io match port {
+                                    RedirectPort::STDIN => this.io.stdin.clone(),
+                                    RedirectPort::STDOUT => this.io.stdout.clone(),
+                                    RedirectPort::STDERR => this.io.stderr.clone(),
+                                    RedirectPort::STDOUT_STDERR => unreachable!(),
+                                    _ => todo!(),
+                                };
+                            }
+                        };
+                        match opt.open(dest) {
+                            Ok(f) => Io::File(Arc::new(f)),
+                            Err(_) if redir.mode == RedirectMode::ReadOrNull => Io::Close,
+                            Err(err) => bail!(this, Error::OpenRedirectionFile(dest.into(), err)),
+                        }
                     };
-                    let f = tri!(
-                        this,
-                        opt.open(file_path)
-                            .map_err(|err| Error::OpenRedirectionFile(file_path.into(), err))
-                    );
-                    let f = Io::File(Arc::new(f));
 
                     match redir.port {
-                        RedirectPort::STDIN => this.io.stdin = f,
-                        RedirectPort::STDOUT => this.io.stdout = f,
+                        RedirectPort::STDIN => this.io.stdin = io,
+                        RedirectPort::STDOUT => this.io.stdout = io,
+                        RedirectPort::STDERR => this.io.stderr = io,
                         RedirectPort::STDOUT_STDERR => {
-                            (this.io.stdout, this.io.stderr) = (f.clone(), f)
+                            (this.io.stdout, this.io.stderr) = (io.clone(), io)
                         }
                         _ => todo!(),
                     }
@@ -1092,6 +1107,7 @@ impl<'a> ExecContext<'a> {
                     for (lhs, port) in pipes {
                         let (tx, rx) = tri!(subctx, Io::new_os_pipe());
                         match *port {
+                            RedirectPort::STDIN => subctx.io.stdin = tx,
                             RedirectPort::STDOUT => subctx.io.stdout = tx,
                             RedirectPort::STDERR => subctx.io.stderr = tx,
                             RedirectPort::STDOUT_STDERR => {

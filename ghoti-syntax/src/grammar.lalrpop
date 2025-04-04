@@ -11,6 +11,7 @@ extern {
         NEWLINE => Token::Newline,
         NOSP => Token::Join,
         WORD => Token::Word(<&'i str>),
+        ESCAPE => Token::Escape(<char>),
         STRING_FRAGMENT => Token::Verbatim(<&'i str>),
         "$VAR" => Token::Variable(<&'i str>),
 
@@ -34,22 +35,10 @@ extern {
         "$(" => Token::DollarLParen,
         "(" => Token::LParen,
         ")" => Token::RParen,
-        "[" => Token::LBracket,
-        "]" => Token::RBracket,
         "{" => Token::LBrace,
         "}" => Token::RBrace,
-        ">" => Token::Gt,
-        ">&" => Token::GtAmp,
-        ">?" => Token::GtQus,
-        "<" => Token::Lt,
-        "<&" => Token::LtAmp,
-        "<?" => Token::LtQus,
-        ">>" => Token::GtGt,
-        "?" => Token::Qus,
-        "&" => Token::Amp,
         "|" => Token::Pipe,
         "&|" => Token::AmpPipe,
-        ">|" => Token::GtPipe,
         ";" => Token::Semi,
         "*" => Token::Star,
         "**" => Token::StarStar,
@@ -57,6 +46,16 @@ extern {
         "~/" => Token::TildeSlash,
         "\"" => Token::DQuote,
         "'" => Token::SQuote,
+
+        "&>" => Token::AmpGt,
+        ">" => Token::Gt(<&'i str>),
+        ">&" => Token::GtAmp(<&'i str>),
+        ">?" => Token::GtQus(<&'i str>),
+        "<" => Token::Lt(<&'i str>),
+        "<&" => Token::LtAmp(<&'i str>),
+        "<?" => Token::LtQus(<&'i str>),
+        ">>" => Token::GtGt(<&'i str>),
+        ">|" => Token::GtPipe(<&'i str>),
     }
 }
 
@@ -110,37 +109,36 @@ Stmt: Stmt = {
 PipeOp: RedirectPort = {
     "|" => RedirectPort::STDOUT,
     "&|" => RedirectPort::STDOUT_STDERR,
-    "&" NOSP <lpos:@L> <port:Word> <rpos:@R> ">|" =>? {
-        match port {
-            Word::Simple(port) => port.parse().ok(),
-            _ => None,
-        }
-        .ok_or_else(|| E::new(lpos, rpos, K::InvalidRedirectPort).into())
+    <lpos:@L> <port:">|"> =>? {
+        port[..port.len() - 2].parse()
+        .map_err(|_| E::new(lpos, lpos + port.len() - 2, K::InvalidRedirectPort).into())
     }
 }
 
 Redirect: Redirect = {
-    <port:("&" NOSP <@L> <WordJoined> NOSP <@R>)?> <mode:RedirectMode> NOSP <dest:Word> =>? {
-        let port = match port {
-            None => mode.default_port(),
-            Some((lpos, port, rpos)) => {
-                match port {
-                    Word::Simple(port) => port.parse().ok(),
-                    _ => None,
-                }
-                .ok_or_else(|| E::new(lpos, rpos, K::InvalidRedirectPort))?
-            }
+    <lpos:@L> <tup:RedirectOp> <dest:Word> =>? {
+        let (port_str, mode) = tup;
+        let port = if port_str == "&" {
+            RedirectPort::STDOUT_STDERR
+        } else if port_str.is_empty() {
+            mode.default_port()
+        } else {
+            port_str.parse().map_err(|_| E::new(lpos, lpos + port_str.len(), K::InvalidRedirectPort))?
         };
-        Ok(Redirect { port, mode, dest: RedirectDest::File(dest) })
+        Ok(Redirect { port, mode, dest })
     },
 };
-RedirectMode: RedirectMode = {
-    "<"  => RedirectMode::Read,
-    "<?" => RedirectMode::ReadOrNull,
-    ">"  => RedirectMode::Write,
-    ">?" => RedirectMode::WriteNoClobber,
-    ">>" => RedirectMode::Append,
-    // TODO: "<&", ">&"
+
+RedirectOp: (&'i str, RedirectMode) = {
+    "&>" => ("&", RedirectMode::Write),
+
+    <s:"<" >  => (&s[..s.len() - 1], RedirectMode::Read),
+    <s:"<?">  => (&s[..s.len() - 2], RedirectMode::ReadOrNull),
+    <s:"<&">  => (&s[..s.len() - 2], RedirectMode::ReadFd),
+    <s:">" >  => (&s[..s.len() - 1], RedirectMode::Write),
+    <s:">?">  => (&s[..s.len() - 2], RedirectMode::WriteNoClobber),
+    <s:">&">  => (&s[..s.len() - 2], RedirectMode::WriteFd),
+    <s:">>">  => (&s[..s.len() - 2], RedirectMode::Append),
 };
 
 StmtBlock: Stmt =
@@ -191,7 +189,8 @@ WordJoined: Word = {
 WordFrag: WordFrag = {
     "~/" => WordFrag::Home { slash: true },
     <WORD> => WordFrag::Literal(<>.into()),
-    <"$VAR"> => WordFrag::Variable(<>.into()),
+    <"$VAR"> => WordFrag::Variable(<>[1..].into()),
+    <ESCAPE> => WordFrag::Literal(<>.into()),
     "*" => WordFrag::Wildcard,
     "**" => WordFrag::WildcardRecursive,
     "$(" <StmtBlock> ")" => WordFrag::Command(<>),
@@ -204,7 +203,7 @@ String: Vec<WordFrag> = {
     "'" <SQuoteFrag*> "'" => <>,
 };
 DQuoteFrag: WordFrag = {
-    <"$VAR"> => WordFrag::VariableNoSplit(<>.into()),
+    <"$VAR"> => WordFrag::VariableNoSplit(<>[1..].into()),
     "$(" <StmtBlock> ")" => WordFrag::CommandNoSplit(<>),
     <STRING_FRAGMENT> => WordFrag::Literal(<>.into()),
 };

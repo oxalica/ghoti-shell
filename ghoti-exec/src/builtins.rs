@@ -211,8 +211,6 @@ pub async fn builtin(ctx: &mut ExecContext<'_>, args: BuiltinArgs) -> ExecResult
 #[derive(Debug, Parser)]
 pub struct CommandArgs {
     #[arg(long, short)]
-    pub all: bool,
-    #[arg(long, short)]
     pub query: bool,
     #[arg(long, short)]
     pub search: bool,
@@ -222,22 +220,43 @@ pub struct CommandArgs {
 }
 
 pub async fn command(ctx: &mut ExecContext<'_>, args: CommandArgs) -> ExecResult<Status> {
-    ensure!(!args.all && !args.query && !args.search, "TODO");
-    let cmd = args.args.first().ok_or(Error::EmptyCommand)?;
-    let exe_path = match ctx.locate_external_command(cmd) {
-        LocateExternalCommand::ExecFile(path) => path,
-        LocateExternalCommand::NotExecFile(path) | LocateExternalCommand::Dir(path) => {
-            return Err(Error::CommandNotFound(format!(
-                "{} (candidate {} is not an executable file)",
-                cmd,
-                path.display(),
-            )));
+    if args.query {
+        let mut found = false;
+        for name in &args.args {
+            if let LocateExternalCommand::ExecFile(_) = ctx.locate_external_command(name) {
+                found = true;
+                break;
+            }
         }
-        LocateExternalCommand::NotFound => {
-            return Err(Error::CommandNotFound(cmd.into()));
+        Ok(found.into())
+    } else if args.search {
+        let mut found = true;
+        let mut buf = String::new();
+        for name in &args.args {
+            if let LocateExternalCommand::ExecFile(path) = ctx.locate_external_command(name) {
+                found = true;
+                writeln!(buf, "{}", path.display()).unwrap();
+            }
         }
-    };
-    ctx.exec_external_command(&exe_path, &args.args).await
+        let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
+        Ok(found.into())
+    } else {
+        let cmd = args.args.first().ok_or(Error::EmptyCommand)?;
+        let exe_path = match ctx.locate_external_command(cmd) {
+            LocateExternalCommand::ExecFile(path) => path,
+            LocateExternalCommand::NotExecFile(path) | LocateExternalCommand::Dir(path) => {
+                return Err(Error::CommandNotFound(format!(
+                    "{} (candidate {} is not an executable file)",
+                    cmd,
+                    path.display(),
+                )));
+            }
+            LocateExternalCommand::NotFound => {
+                return Err(Error::CommandNotFound(cmd.into()));
+            }
+        };
+        ctx.exec_external_command(&exe_path, &args.args).await
+    }
 }
 
 pub async fn source(ctx: &mut ExecContext<'_>, args: &[String]) -> ExecResult<()> {

@@ -70,6 +70,10 @@ enum Token<'i> {
     Tilde,
     #[token("~/")]
     TildeSlash,
+    #[token("||")]
+    PipePipe,
+    #[token("&&")]
+    AmpAmp,
 
     #[token("&>")]
     AmpGt,

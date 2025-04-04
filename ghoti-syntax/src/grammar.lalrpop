@@ -46,6 +46,8 @@ extern {
         "~/" => Token::TildeSlash,
         "\"" => Token::DQuote,
         "'" => Token::SQuote,
+        "&&" => Token::AmpAmp,
+        "||" => Token::PipePipe,
 
         "&>" => Token::AmpGt,
         ">" => Token::Gt(<&'i str>),
@@ -100,10 +102,24 @@ Stmt: Stmt = {
     #[precedence(level = "3")]
     <pos:@L> "not" <s:Stmt> => Stmt::Not(pos as _, s.into()),
 
-    #[precedence(level = "3")]
-    <pos:@L> "and" <s:Stmt> => Stmt::And(pos as _, s.into()),
-    #[precedence(level = "3")]
-    <pos:@L> "or" <s:Stmt> => Stmt::Or(pos as _, s.into()),
+    #[precedence(level = "4")]
+    #[assoc(side = "right")]
+    <pos:@L> <lhs:Stmt> "and" <rhs:Stmt> => Stmt::BinaryAnd(pos as _, lhs.into(), rhs.into()),
+    #[precedence(level = "4")]
+    #[assoc(side = "right")]
+    <pos:@L> <lhs:Stmt> "&&" <rhs:Stmt> => Stmt::BinaryAnd(pos as _, lhs.into(), rhs.into()),
+
+    #[precedence(level = "5")]
+    #[assoc(side = "right")]
+    <pos:@L> <lhs:Stmt> "or" <rhs:Stmt> => Stmt::BinaryOr(pos as _, lhs.into(), rhs.into()),
+    #[precedence(level = "5")]
+    #[assoc(side = "right")]
+    <pos:@L> <lhs:Stmt> "||" <rhs:Stmt> => Stmt::BinaryOr(pos as _, lhs.into(), rhs.into()),
+
+    #[precedence(level = "6")]
+    <pos:@L> "and" <s:Stmt> => Stmt::UnaryAnd(pos as _, s.into()),
+    #[precedence(level = "6")]
+    <pos:@L> "or" <s:Stmt> => Stmt::UnaryOr(pos as _, s.into()),
 };
 
 PipeOp: RedirectPort = {

@@ -1128,19 +1128,31 @@ impl<'a> ExecContext<'a> {
                 self.set_last_status(pipe_status.last().copied().unwrap());
                 self.last_pipe_status = pipe_status;
             }
-            Stmt::Not(_pos, stmt) => {
-                self.exec_stmt(stmt).await?;
+            Stmt::Not(_pos, inner) => {
+                self.exec_stmt(inner).await?;
                 let ok = self.last_status().is_success();
                 self.set_last_status(!ok);
             }
-            Stmt::And(_pos, stmt) => {
+            Stmt::BinaryAnd(_pos, lhs, rhs) => {
+                self.exec_stmt(lhs).await?;
                 if self.last_status.is_success() {
-                    self.exec_stmt(stmt).await?;
+                    self.exec_stmt(rhs).await?;
                 }
             }
-            Stmt::Or(_pos, stmt) => {
+            Stmt::UnaryAnd(_pos, inner) => {
+                if self.last_status.is_success() {
+                    self.exec_stmt(inner).await?;
+                }
+            }
+            Stmt::BinaryOr(_pos, lhs, rhs) => {
+                self.exec_stmt(lhs).await?;
                 if !self.last_status.is_success() {
-                    self.exec_stmt(stmt).await?;
+                    self.exec_stmt(rhs).await?;
+                }
+            }
+            Stmt::UnaryOr(_pos, inner) => {
+                if !self.last_status.is_success() {
+                    self.exec_stmt(inner).await?;
                 }
             }
         }

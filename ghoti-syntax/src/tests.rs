@@ -27,7 +27,7 @@ fn hoist_and_or() {
         if matches!(
             &**cond,
             Stmt::Block(_, b)
-            if matches!(b[1], Stmt::And(..))
+            if matches!(b[1], Stmt::UnaryAnd(..))
         )
     ));
 
@@ -44,7 +44,7 @@ fn hoist_and_or() {
         if matches!(
             &**cond,
             Stmt::Block(_, b)
-            if matches!(b[1], Stmt::Or(..))
+            if matches!(b[1], Stmt::UnaryOr(..))
         )
         && matches!(&**body, Stmt::Block(_, b) if b.is_empty())
     ));

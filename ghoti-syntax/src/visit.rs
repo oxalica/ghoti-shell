@@ -46,8 +46,10 @@ define_visitor! {
             Stmt::Redirect(pos, s, redirects) => v.visit_redirect_stmt_mut(*pos, s, redirects),
             Stmt::Pipe(pos, pipes, rhs) => v.visit_pipe_stmt_mut(*pos, pipes, rhs),
             Stmt::Not(pos, s) => v.visit_not_stmt_mut(*pos, s),
-            Stmt::And(pos, s) => v.visit_and_stmt_mut(*pos, s),
-            Stmt::Or(pos, s) => v.visit_or_stmt_mut(*pos, s),
+            Stmt::UnaryAnd(pos, s) => v.visit_unary_and_stmt_mut(*pos, s),
+            Stmt::UnaryOr(pos, s) => v.visit_unary_or_stmt_mut(*pos, s),
+            Stmt::BinaryAnd(pos, lhs, rhs) => v.visit_binary_and_stmt_mut(*pos, lhs, rhs),
+            Stmt::BinaryOr(pos, lhs, rhs) => v.visit_binary_or_stmt_mut(*pos, lhs, rhs),
         }
     }
 
@@ -115,12 +117,22 @@ define_visitor! {
         v.visit_stmt_mut(s);
     }
 
-    fn visit_and_stmt_mut(v, _pos: Pos, s: &'i mut Stmt) {
+    fn visit_unary_and_stmt_mut(v, _pos: Pos, s: &'i mut Stmt) {
         v.visit_stmt_mut(s);
     }
 
-    fn visit_or_stmt_mut(v, _pos: Pos, s: &'i mut Stmt) {
+    fn visit_unary_or_stmt_mut(v, _pos: Pos, s: &'i mut Stmt) {
         v.visit_stmt_mut(s);
+    }
+
+    fn visit_binary_and_stmt_mut(v, _pos: Pos, lhs: &'i mut Stmt, rhs: &'i mut Stmt) {
+        v.visit_stmt_mut(lhs);
+        v.visit_stmt_mut(rhs);
+    }
+
+    fn visit_binary_or_stmt_mut(v, _pos: Pos, lhs: &'i mut Stmt, rhs: &'i mut Stmt) {
+        v.visit_stmt_mut(lhs);
+        v.visit_stmt_mut(rhs);
     }
 
     fn visit_switch_case_mut(v, case: &'i mut SwitchCase) {

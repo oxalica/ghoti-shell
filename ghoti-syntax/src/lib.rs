@@ -39,8 +39,10 @@ pub enum Stmt {
     Pipe(Pos, Vec<(Stmt, RedirectPort)>, Box<Stmt>),
 
     Not(Pos, Box<Stmt>),
-    And(Pos, Box<Stmt>),
-    Or(Pos, Box<Stmt>),
+    UnaryAnd(Pos, Box<Stmt>),
+    UnaryOr(Pos, Box<Stmt>),
+    BinaryAnd(Pos, Box<Stmt>, Box<Stmt>),
+    BinaryOr(Pos, Box<Stmt>, Box<Stmt>),
 }
 
 impl Stmt {
@@ -59,8 +61,10 @@ impl Stmt {
             | Stmt::Redirect(pos, ..)
             | Stmt::Pipe(pos, ..)
             | Stmt::Not(pos, ..)
-            | Stmt::And(pos, ..)
-            | Stmt::Or(pos, ..) => *pos,
+            | Stmt::UnaryAnd(pos, ..)
+            | Stmt::UnaryOr(pos, ..)
+            | Stmt::BinaryAnd(pos, ..)
+            | Stmt::BinaryOr(pos, ..) => *pos,
         }
     }
 }

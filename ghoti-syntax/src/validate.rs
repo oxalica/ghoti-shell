@@ -42,7 +42,7 @@ impl ValidateVisitor {
         let Stmt::Block(_, body) = body else { return };
         let pos = body
             .iter()
-            .position(|s| !matches!(s, Stmt::And(..) | Stmt::Or(..)))
+            .position(|s| !matches!(s, Stmt::UnaryAnd(..) | Stmt::UnaryOr(..)))
             .unwrap_or(body.len());
         if pos == 0 {
             return;
@@ -121,7 +121,7 @@ impl<'i> visit::VisitorMut<'i> for ValidateVisitor {
         }
     }
 
-    fn visit_and_stmt_mut(&mut self, loc: Pos, s: &'i mut Stmt) {
+    fn visit_unary_and_stmt_mut(&mut self, loc: Pos, s: &'i mut Stmt) {
         if self.at_block_start {
             self.emit_err(loc, "and");
         } else {
@@ -129,7 +129,7 @@ impl<'i> visit::VisitorMut<'i> for ValidateVisitor {
         }
     }
 
-    fn visit_or_stmt_mut(&mut self, loc: Pos, s: &'i mut Stmt) {
+    fn visit_unary_or_stmt_mut(&mut self, loc: Pos, s: &'i mut Stmt) {
         if self.at_block_start {
             self.emit_err(loc, "or");
         } else {

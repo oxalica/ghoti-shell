@@ -159,7 +159,7 @@ Control: Stmt = {
 If: Stmt = {
     <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "end" =>
         Stmt::If(pos as _, cond.into(), then.into(), None),
-    <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "else" <else_:If> "end" =>
+    <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "else" <else_:If> =>
         Stmt::If(pos as _, cond.into(), then.into(), Some(else_.into())),
     <pos:@L> "if" <cond:Stmt> EOS <then:StmtBlock> "else" EOS <else_:StmtBlock> "end" =>
         Stmt::If(pos as _, cond.into(), then.into(), Some(else_.into())),

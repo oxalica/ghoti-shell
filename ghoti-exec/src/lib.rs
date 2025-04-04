@@ -767,7 +767,7 @@ impl<'a> ExecContext<'a> {
             return;
         };
 
-        if dbg!(var.name_to_path_cache().is_some()) {
+        if var.name_to_path_cache().is_some() {
             return;
         }
 
@@ -794,7 +794,7 @@ impl<'a> ExecContext<'a> {
         .await
         .expect("no panic");
 
-        var.set_name_to_path_cache(dbg!(map));
+        var.set_name_to_path_cache(map);
     }
 
     /// Try to find and source the autoload function `name`.

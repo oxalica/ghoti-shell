@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::{Args, Parser};
 use owo_colors::AnsiColors;
 
 use crate::command::{self, BoxCommand, UserFunc};
@@ -51,52 +51,72 @@ pub(crate) struct FunctionOpts {
 
 // TODO
 #[derive(Debug, Parser)]
-pub struct SetArgs {
+pub struct SetOpts {
+    #[command(flatten)]
+    op: SetOp,
+
+    #[command(flatten)]
+    scope: SetScope,
+
+    #[command(flatten)]
+    attr: SetVarAttr,
+
+    #[arg(trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct SetScope {
     #[arg(long, short)]
     local: bool,
     #[arg(long, short)]
     function: bool,
     #[arg(long, short)]
     global: bool,
-    #[arg(long, short)]
+    #[arg(long, short = 'U')]
     universal: bool,
+}
 
-    #[arg(long, short = 'x')]
-    export: bool,
-
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct SetOp {
     #[arg(long, short)]
     erase: bool,
     #[arg(long, short)]
     query: bool,
-
-    #[arg(trailing_var_arg = true)]
-    args: Vec<String>,
 }
 
-pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult<Option<Status>> {
-    let scope_flag_cnt = [args.local, args.function, args.global, args.universal]
-        .iter()
-        .map(|&b| b as u8)
-        .sum::<u8>();
-    ensure!(scope_flag_cnt <= 1, "scope flags are mutually exclusive");
-    ensure!(
-        args.erase as u8 + args.query as u8 <= 1,
-        "--erase and --query are mutually exclusive",
-    );
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct SetVarAttr {
+    #[arg(long, short = 'x')]
+    export: bool,
+    #[arg(long, short)]
+    unexport: bool,
+}
 
-    let scope = if args.local {
+pub async fn set(ctx: &mut ExecContext<'_>, args: SetOpts) -> ExecResult<Option<Status>> {
+    let scope = if args.scope.local {
         VarScope::Local
-    } else if args.function {
+    } else if args.scope.function {
         VarScope::Function
-    } else if args.global {
+    } else if args.scope.global {
         VarScope::Global
-    } else if args.universal {
+    } else if args.scope.universal {
         VarScope::Universal
     } else {
         VarScope::Auto
     };
 
-    if args.query {
+    if args.op.erase || args.op.query {
+        ensure!(
+            !args.attr.export && !args.attr.unexport,
+            "--export or --unexport can only be used for setting or listing variables",
+        );
+    }
+
+    if args.op.query {
         let mut fail_cnt = 0usize;
         for name in &args.args {
             ensure!(scope == VarScope::Auto, "TODO");
@@ -104,9 +124,8 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult<Option<
                 fail_cnt += 1;
             }
         }
-        return Ok(Some(fail_cnt.into()));
-    }
-    if args.erase {
+        Ok(Some(fail_cnt.into()))
+    } else if args.op.erase {
         for name in &args.args {
             validate_variable_name(name)?;
         }
@@ -116,46 +135,40 @@ pub async fn set(ctx: &mut ExecContext<'_>, args: SetArgs) -> ExecResult<Option<
                 fail_cnt += 1;
             }
         }
-        return Ok(Some(fail_cnt.into()));
-    }
+        Ok(Some(fail_cnt.into()))
+    } else if let Some((name, vals)) = args.args.split_first() {
+        validate_variable_name(name)?;
+        ensure!(
+            !ctx.has_special_var(name),
+            "cannot modify special variable: {name:?}",
+        );
+        let mut var = Variable::new_list(vals.to_vec());
+        var.export = args.attr.export;
+        ctx.set_var(name, scope, var);
+        // Keep previous status.
+        Ok(None)
+    } else {
+        let mut buf = String::new();
+        ctx.list_vars::<()>(scope, |name, var| {
+            if args.attr.export && !var.export || args.attr.unexport && var.export {
+                return ControlFlow::Continue(());
+            }
 
-    match args.args.split_first() {
-        None => {
-            let mut buf = String::new();
-            ctx.list_vars::<()>(scope, |name, var| {
-                if args.export && !var.export {
-                    return ControlFlow::Continue(());
-                }
-
-                buf.push_str(name);
-                if !var.value.is_empty() {
-                    buf.push(' ');
-                    for (idx, val) in var.value.iter().enumerate() {
-                        if idx != 0 {
-                            buf.push_str("  ");
-                        }
-                        write!(buf, "\"{}\"", val.escape_debug()).unwrap();
+            buf.push_str(name);
+            if !var.value.is_empty() {
+                buf.push(' ');
+                for (idx, val) in var.value.iter().enumerate() {
+                    if idx != 0 {
+                        buf.push_str("  ");
                     }
+                    write!(buf, "\"{}\"", val.escape_debug()).unwrap();
                 }
-                buf.push('\n');
-                ControlFlow::Continue(())
-            });
-            let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
-            Ok(Some(Status::SUCCESS))
-        }
-        Some((name, vals)) => {
-            validate_variable_name(name)?;
-            ensure!(
-                !ctx.has_special_var(name),
-                "cannot modify special variable: {name:?}",
-            );
-            let var = Variable {
-                value: vals.to_vec(),
-                export: args.export,
-            };
-            ctx.set_var(name, scope, var);
-            Ok(None)
-        }
+            }
+            buf.push('\n');
+            ControlFlow::Continue(())
+        });
+        let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
+        Ok(Some(Status::SUCCESS))
     }
 }
 
@@ -257,6 +270,8 @@ pub struct FunctionsOpts {
     pub erase: bool,
     #[arg(long, short)]
     pub query: bool,
+    #[arg(long, short)]
+    pub all: bool,
 
     pub funcs: Vec<String>,
 }
@@ -265,6 +280,10 @@ pub async fn functions(ctx: &mut ExecContext<'_>, args: FunctionsOpts) -> ExecRe
     ensure!(
         args.erase as u8 + args.query as u8 <= 1,
         "--erase and --query are mutually exclusive",
+    );
+    ensure!(
+        !args.all || args.funcs.is_empty(),
+        "--all can only be used without positional arguments"
     );
 
     if args.erase {
@@ -282,6 +301,17 @@ pub async fn functions(ctx: &mut ExecContext<'_>, args: FunctionsOpts) -> ExecRe
             }
         }
         Ok(fail_cnt.into())
+    } else if args.funcs.is_empty() {
+        let mut buf = String::new();
+        ctx.list_funcs::<()>(|name, _cmd| {
+            if args.all || !name.starts_with("_") {
+                writeln!(buf, "{name}").unwrap();
+            }
+            ControlFlow::Continue(())
+        })
+        .await;
+        let _: ExecResult<_> = ctx.io().stdout.write_all(buf).await;
+        Ok(Status::SUCCESS)
     } else {
         let mut buf = String::new();
         let mut fail_cnt = 0usize;

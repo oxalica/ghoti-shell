@@ -37,6 +37,7 @@ extern {
         ")" => Token::RParen,
         "{" => Token::LBrace,
         "}" => Token::RBrace,
+        "," => Token::Comma,
         "|" => Token::Pipe,
         "&|" => Token::AmpPipe,
         ";" => Token::Semi,
@@ -190,9 +191,9 @@ Word: Word = {
 };
 
 WordJoined: Word = {
-    <WordFrag> => Word::from(<>),
+    <SingleWordFrag> => Word::from(<>),
     <String> => Word::Complex(<>),
-    <w:WordJoined> NOSP <frag:WordFrag> => w.append(frag),
+    <w:WordJoined> NOSP <frag:SingleWordFrag> => w.append(frag),
     <w:WordJoined> NOSP <frags:String> => {
         let fs = match w {
             Word::Simple(w) => std::iter::once(WordFrag::Literal(w)).chain(frags).collect(),
@@ -202,7 +203,7 @@ WordJoined: Word = {
     }
 };
 
-WordFrag: WordFrag = {
+SingleWordFrag: WordFrag = {
     "~/" => WordFrag::Home { slash: true },
     <WORD> => WordFrag::Literal(<>.into()),
     <lpos:@L> <s:"$VAR"> <rpos:@R> =>? {
@@ -215,7 +216,7 @@ WordFrag: WordFrag = {
     "**" => WordFrag::WildcardRecursive,
     "$(" <StmtBlock> ")" => WordFrag::Command(<>),
     "(" <StmtBlock> ")" => WordFrag::Command(<>),
-    // TODO: "{"
+    <BraceWord>,
 };
 
 String: Vec<WordFrag> = {
@@ -233,3 +234,19 @@ DQuoteFrag: WordFrag = {
 };
 SQuoteFrag: WordFrag =
     <STRING_FRAGMENT> => WordFrag::Literal(<>.into());
+
+BraceWord: WordFrag =
+    "{" <mut alts:(<BraceAltWord> ",")*> <last:BraceAltWord> "}" => {
+        alts.push(last);
+        WordFrag::Brace(alts)
+    };
+
+BraceAltWord: Word = <BraceAlt> => Word::Complex(<>);
+
+BraceAlt: Vec<WordFrag> = {
+    => Vec::new(),
+    <mut frags:BraceAlt> <s:STRING_FRAGMENT> => { frags.push(WordFrag::Literal(s.into())); frags },
+    // NOSP is not emitted inside braces.
+    <mut frags:BraceAlt> <w:SingleWordFrag> => { frags.push(w); frags },
+    <mut frags:BraceAlt> <s:String> => { frags.extend(s); frags },
+};

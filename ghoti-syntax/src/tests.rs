@@ -139,3 +139,19 @@ fn unknow_escape() {
         )
     ));
 }
+
+#[test]
+fn brace() {
+    let src = r#"echo { $VAR"s"}{a,{$$b,c}}"#;
+    let ast = parse_source(src).unwrap();
+    dbg!(&ast);
+    assert!(matches!(
+        &ast.stmts[0],
+        Stmt::Command(_, ws)
+        if matches!(
+            &ws[..],
+            [Word::Simple(cmd), Word::Complex(frags)]
+            if cmd == "echo" && frags.len() == 2
+        )
+    ));
+}

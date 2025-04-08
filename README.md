@@ -6,13 +6,13 @@ A [fish]-like shell prototype to explore asynchronous execution.
 
 ## What
 
-- This is mostly an Proof of Concept project. I may or may not abandon it at
+- This is mostly a proof of concept project. I may or may not abandon it at
   any time.
 
   Only some essential builtins are implemented. Do not try to use it as a real
   shell.
 
-- To proof that we do not require sub-shell or fork/exec for concurrency.
+- To prove that we do not require sub-shell or fork/exec for concurrency.
 
   https://github.com/fish-shell/fish-shell/issues/1396 which is the main issue
   preventing me from using fish-shell, is fixed in ghoti-shell. I've been
@@ -22,6 +22,8 @@ A [fish]-like shell prototype to explore asynchronous execution.
   The simple function-as-alias usage that fish is still struggling with:
 
   ```fish
+  # {fish,ghoti}-shell>
+
   function y; yes; end
   function len; wc -c; end
   y | head -n 20 | len # This should terminate.
@@ -31,9 +33,7 @@ A [fish]-like shell prototype to explore asynchronous execution.
   ghoti runs the above script without any buffering.
 
 - We are less eager to use UNIX features in implementation. So it's relatively
-  easy to support Windows.
-
-  Nevertheless, it does not currently support Windows.
+  easy to support Windows. Regardless, we do not currently support Windows.
 
 ## Why not fork and/or contribute upstream?
 
@@ -43,27 +43,32 @@ A [fish]-like shell prototype to explore asynchronous execution.
   But mainly: I'm not familiar with it at all.
 
 - Production code has tons of complexity and entanglement. It's also not
-  possible to investigating new structure (async) without rewriting every
+  possible to investigate new structures (async) without rewriting every
   single builtins.
 
-- It may not be a good idea to do so! I might try more different approaches
-  and/or do benchmarks before drawing any reasonable conclusion.
+- It may not be a good idea to async-ify everything! I might try different
+  approaches and/or do benchmarks before drawing conclusion.
 
 ## How
 
-- Currently, `tokio` single-threaded runtime is used as async runtime.
+- Currently, `tokio` single-threaded runtime is used as the async runtime.
 
 - On task-forking, each pipeline segment creates a new function context as in a
-  new function, every outer non-global variables are inaccessible during the
-  execution of individual piped command.
+  new function, every outer non-global variable is inaccessible during the
+  execution of each individual piped command.
+  
+  Relevant code is under `async fn exec_stmt_inner` in
+  [`ghoti-exec/src/lib.rs`](https://github.com/oxalica/ghoti-shell/blob/376799af3a515169d0a258dadd09fde9aa642a0f/ghoti-exec/src/lib.rs#L1089)
 
   Thus we do not need to workaround mutable-xor-shared (`RefCell`) on every
-  local variables, which saves a lot of complexity and time cost.
+  local variable, which saves a lot of code complexity and time cost.
 
   Global variables are still `RefCell` as a fallback solution if
   variable-modification is really necessary inside the piped commands.
 
   ```fish
+  # ghoti-shell>
+
   # Print nothing.
   set -f a 1 | set -f a 2
   echo $a 

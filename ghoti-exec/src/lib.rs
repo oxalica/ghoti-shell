@@ -803,7 +803,7 @@ impl<'a> ExecContext<'a> {
     /// Try to find and source the autoload function `name`.
     ///
     /// Return `Some(())` if a file is found and sourced, `None` otherwise.
-    /// It does not check if the sourced file actually contains any relavent definition.
+    /// It does not check if the sourced file actually contains any relevant definition.
     async fn try_autoload_func(&mut self, name: &str) -> Option<()> {
         debug_assert!(!name.contains("/"));
 

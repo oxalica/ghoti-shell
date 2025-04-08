@@ -5,7 +5,7 @@ use owo_colors::OwoColorize;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::hint::Hinter;
-use rustyline::history::DefaultHistory;
+use rustyline::history::MemHistory;
 use rustyline::{Editor, Helper, Highlighter, Validator};
 
 #[derive(Helper, Validator, Highlighter)]
@@ -63,7 +63,8 @@ pub fn run_repl(
     rt: &tokio::runtime::Runtime,
     ctx: &mut ExecContext<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rl: Editor<ShellHelper, DefaultHistory> = rustyline::Editor::new()?;
+    let mut rl: Editor<ShellHelper, MemHistory> =
+        rustyline::Editor::with_history(rustyline::Config::default(), MemHistory::new())?;
     rl.set_helper(Some(ShellHelper { ctx }));
 
     loop {
@@ -89,6 +90,7 @@ pub fn run_repl(
             Err(ReadlineError::Interrupted) => continue,
             Err(err) => return Err(err.into()),
         };
+        rl.add_history_entry(input.clone())?;
         let ctx = &mut *rl.helper_mut().unwrap().ctx;
 
         rt.block_on(ctx.exec_source(None, input));

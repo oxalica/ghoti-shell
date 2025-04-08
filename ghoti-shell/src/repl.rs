@@ -74,9 +74,9 @@ pub fn run_repl(
 
             let st = ctx.last_status();
             if st.is_success() {
-                "> ".to_owned()
+                "ghoti-shell> ".to_owned()
             } else {
-                format!("[{st}]> ")
+                format!("ghoti-shell[{st}]> ")
             }
         };
 

@@ -1,8 +1,9 @@
+//! WIP
 use std::fmt;
 use std::str::FromStr;
 
 mod error;
-pub mod parse;
+mod parse;
 mod validate;
 pub mod visit;
 

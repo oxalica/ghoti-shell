@@ -1,8 +1,10 @@
 [package]
 name = "ghoti-exec"
-version = "0.1.0"
+version = "0.0.0"
+description.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 annotate-snippets = "0.11.5"
@@ -10,7 +12,7 @@ clap = { version = "4.5.34", default-features = false, features = ["derive", "st
 dyn-clone = "1.0.19"
 either = "1.15.0"
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
-ghoti-syntax.path = "../ghoti-syntax"
+ghoti-syntax = { version = "0.0.0", path = "../ghoti-syntax" }
 itertools = "0.14.0"
 os_pipe = "1.2.1"
 owo-colors = "4.2"

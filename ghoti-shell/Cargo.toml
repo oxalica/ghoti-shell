@@ -1,12 +1,15 @@
 [package]
 name = "ghoti-shell"
-version = "0.1.0"
+version = "0.0.0"
+description.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../README.md"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-ghoti-exec.path = "../ghoti-exec"
+ghoti-exec = { version = "0.0.0", path = "../ghoti-exec" }
 owo-colors = "4.2.0"
 rustyline = { version = "15.0.0", features = ["derive"] }
 tokio = { version = "1.44.1", features = ["io-util", "macros", "process", "rt"] }

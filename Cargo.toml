@@ -6,3 +6,5 @@ default-members = ["ghoti-shell"]
 [workspace.package]
 edition = "2024"
 license = "GPL-2.0-only"
+repository = "https://github.com/oxalica/ghoti-shell"
+description = "POC"
